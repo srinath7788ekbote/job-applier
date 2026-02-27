@@ -1,0 +1,6 @@
+[submodule "vendor/job-scraper"]
+	path = vendor/job-scraper
+	url = https://github.com/srinath7788ekbote/Job_scraper.git
+[submodule "vendor/resume-skill"]
+	path = vendor/resume-skill
+	url = https://github.com/srinath7788ekbote/resume-skill.git

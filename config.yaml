@@ -1,0 +1,30 @@
+pipeline:
+  target_role: "Site Reliability Engineer"  # edit this: job title to search
+  target_location:                          # edit this: one or more locations
+    - "Abu Dhabi"
+  target_platforms:                         # linkedin | glassdoor | naukri
+    - "linkedin"
+  max_jobs_per_run: 3                       # max jobs to process per pipeline run
+  days_back: 7                              # scrape jobs posted in last N days
+  min_match_score: 60                       # skip jobs below this ATS score (0-100)
+  resume_template: "professional"           # professional | modern | classic
+
+paths:
+  base_resume: "data/base_resume.pdf"       # drop your resume here (docx or pdf)
+  excel_tracker: "data/jobs_tracker.xlsx"
+  tailored_resumes_dir: "data/tailored"
+  scraper_vendor: "vendor/job-scraper"
+  resume_skill_vendor: "vendor/resume-skill"
+  logs_dir: "logs"
+
+playwright:
+  headless: true                            # true = silent; false = visible browser
+  slow_mo: 50                               # ms between Playwright actions
+  min_delay: 1.5                            # seconds between UI actions
+  max_delay: 4.0
+  captcha_keywords:                         # page text that signals a CAPTCHA
+    - "verify you are human"
+    - "captcha"
+    - "i'm not a robot"
+    - "security check"
+    - "prove you're human"

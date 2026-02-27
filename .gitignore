@@ -1,0 +1,45 @@
+# Environment — NEVER commit credentials
+.env
+
+# Logs
+logs/*.log
+logs/ran_dates.txt
+
+# Tailored resumes (personal data — generated per run)
+data/tailored/*.pdf
+
+# Your resume (personal data — add your own, never commit)
+data/base_resume.pdf
+data/base_resume.docx
+
+# Excel temp/lock files
+data/~$*.xlsx
+
+# Profile and session cache (personal data)
+data/profile_cache.json
+data/profile_cache.meta.json
+data/linkedin_session.json
+
+# Excel tracker (personal data — generated per run)
+data/jobs_tracker.xlsx
+data/jobs_tracker_*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Playwright-cli session snapshots and screenshots
+.playwright-cli/
+*.png
+
+# Temp scraper output
+jobs.json
+jobs.csv
+
+# OS
+.DS_Store
+Thumbs.db

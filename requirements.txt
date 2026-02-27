@@ -1,0 +1,25 @@
+# Core
+python-dotenv>=1.0.0
+pyyaml>=6.0.1
+requests>=2.31.0
+
+# Resume parsing
+pdfplumber>=0.10.0
+pypdf>=3.0.0
+python-docx>=0.8.11
+
+# Excel tracker
+openpyxl>=3.1.0
+
+# Browser automation
+playwright>=1.40.0
+
+# Scraper deps (also used in vendor/job-scraper)
+pandas>=2.0.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+python-dateutil>=2.8.2
+
+# Optional LLM providers (uncomment whichever you use):
+# anthropic>=0.40.0          # Anthropic SDK — vision + text fallback
+# google-generativeai>=0.8.0 # Gemini vision fallback
