@@ -388,8 +388,23 @@ def apply_external_form(
         log.info(f"Agent browser result: {agent_result}")
         return agent_result
 
+    # ── No agent CLI available ─────────────────────────────────────────────────
+    # Signal back to the pipeline that a running agent (e.g. openclaw) should
+    # handle this form directly using its own browser tools.
+    # main_pipeline.py will write a handoff file and the agent picks it up.
+    log.info("No agent CLI available — signalling agent_handoff_required")
+    return {
+        "success": False,
+        "method": "agent_handoff_required",
+        "url": apply_url,
+        "resume_path": resume_path,
+        "error": None,
+    }
+
     # ── Step 2: Vision-guided Playwright fill ─────────────────────────────────
     # No agent CLI available — fall back to screenshot + vision model
+    # NOTE: unreachable when agent_handoff_required is returned above.
+    # Kept for reference / future use with a vision API key.
     log.info("No agent CLI available — using vision-guided Playwright fill")
     log.info(f"Navigating to external form: {apply_url}")
     page.goto(apply_url, wait_until="domcontentloaded", timeout=60000)

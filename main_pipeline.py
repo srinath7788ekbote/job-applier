@@ -16,6 +16,7 @@ Usage:
   python main_pipeline.py --dry-run    # scrape + score + tailor, no browser apply
 """
 
+import json
 import logging
 import random
 import sys
@@ -322,7 +323,32 @@ def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
         )
 
         reason = apply_result.get("reason", "")
+        method = apply_result.get("method", "")
         error  = apply_result.get("error") or ""
+
+        # ── Agent handoff required (openclaw running agent) ──────────────────
+        # The pipeline is running under openclaw (no claude -p CLI).
+        # Write a handoff file so the running agent picks it up and applies directly.
+        if method == "agent_handoff_required":
+            handoff_path = BASE_DIR / "data" / "agent_handoff.json"
+            handoff_path.parent.mkdir(parents=True, exist_ok=True)
+            handoff = {
+                "job_id":      jid,
+                "title":       title,
+                "company":     company,
+                "apply_url":   apply_result.get("url", job.get("apply_url", "")),
+                "resume_path": apply_result.get("resume_path", resume_to_upload),
+                "profile":     profile,
+                "tracker":     str(config.excel_tracker),
+            }
+            handoff_path.write_text(json.dumps(handoff, indent=2), encoding="utf-8")
+            status = STATUS_PENDING
+            notes  = f"agent_handoff_required — openclaw agent will apply via playwright-cli. Handoff: {handoff_path}"
+            update_status(str(config.excel_tracker), jid, status, notes)
+            log.info(f"Handoff file written: {handoff_path}")
+            log.info("Openclaw agent will complete this application via playwright-cli")
+            processed += 1
+            continue
 
         if apply_result["success"]:
             status = STATUS_APPLIED

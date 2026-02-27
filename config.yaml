@@ -1,7 +1,7 @@
 pipeline:
   target_role: "Site Reliability Engineer"  # edit this: job title to search
   target_location:                          # edit this: one or more locations
-    - "Abu Dhabi"
+    - "Dubai"
   target_platforms:                         # linkedin | glassdoor | naukri
     - "linkedin"
   max_jobs_per_run: 3                       # max jobs to process per pipeline run
