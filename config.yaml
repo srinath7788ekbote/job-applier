@@ -2,10 +2,11 @@ pipeline:
   target_role: "Site Reliability Engineer"  # edit this: job title to search
   target_location:                          # edit this: one or more locations
     - "Dubai"
+    - "Abu Dhabi"
   target_platforms:                         # linkedin | glassdoor | naukri
     - "linkedin"
   max_jobs_per_run: 3                       # max jobs to process per pipeline run
-  days_back: 7                              # scrape jobs posted in last N days
+  days_back: 1                              # scrape jobs posted in last N days
   min_match_score: 60                       # skip jobs below this ATS score (0-100)
   resume_template: "professional"           # professional | modern | classic
 
@@ -18,7 +19,7 @@ paths:
   logs_dir: "logs"
 
 playwright:
-  headless: true                            # true = silent; false = visible browser
+  headless: false                           # true = silent; false = visible browser
   slow_mo: 50                               # ms between Playwright actions
   min_delay: 1.5                            # seconds between UI actions
   max_delay: 4.0

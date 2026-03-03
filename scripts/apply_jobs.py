@@ -216,8 +216,16 @@ def apply_linkedin_easy_apply(
                 "error": "CAPTCHA detected — apply manually"}
 
     if _detect_linkedin_auth_wall(page):
-        return {"success": False, "method": "easy_apply", "reason": "linkedin_auth_required",
-                "error": "LinkedIn sign-in wall — browser session not authenticated"}
+        # Auth wall hit — but the job may still have an external apply URL embedded in the page.
+        # Try to extract it and hand off to the openclaw agent rather than giving up.
+        log.info("LinkedIn auth wall detected — attempting to extract external apply URL for agent handoff")
+        external_url = _extract_external_apply_url(page)
+        if external_url:
+            log.info(f"External URL found despite auth wall: {external_url} — handing off to agent")
+            return apply_external_form(page, external_url, resume_path, profile, min_delay, max_delay)
+        # No external URL extractable — fall back to the job URL itself for agent handoff
+        log.info("No external URL found — handing off job URL directly to agent")
+        return apply_external_form(page, job_url, resume_path, profile, min_delay, max_delay)
 
     # Find Easy Apply button
     easy_apply_btn = None
