@@ -88,9 +88,11 @@ def _call_via_openclaw_cli(prompt: str, model: str) -> Optional[str]:
 
 
 def _call_via_nvidia_nim(prompt: str, system: str) -> str:
-    """NVIDIA NIM OpenAI-compatible API — uses key from openclaw.json."""
+    """NVIDIA NIM OpenAI-compatible API — key loaded from NVIDIA_API_KEY in .env."""
     import urllib.request, json as _json
-    api_key = "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"
+    api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("NVIDIA_API_KEY not set in .env")
     url = "https://integrate.api.nvidia.com/v1/chat/completions"
     messages = []
     if system:
