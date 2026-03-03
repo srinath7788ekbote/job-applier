@@ -1,4 +1,4 @@
-"""
+﻿"""
 update_excel.py
 Manages the jobs_tracker.xlsx Excel file using openpyxl.
 
@@ -219,7 +219,7 @@ def update_status(
             for cell in row:
                 cell.fill = fill
             _safe_save(wb, actual_path)
-            log.info(f"Updated job {job_id} → {status}")
+            log.info(f"Updated job {job_id} -> {status}")
             return True
 
     log.warning(f"job_id {job_id} not found in tracker")
