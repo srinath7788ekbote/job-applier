@@ -87,6 +87,30 @@ def _call_via_openclaw_cli(prompt: str, model: str) -> Optional[str]:
     return _call_cli("openclaw", prompt, model)
 
 
+def _call_via_nvidia_nim(prompt: str, system: str) -> str:
+    """NVIDIA NIM OpenAI-compatible API — uses key from openclaw.json."""
+    import urllib.request, json as _json
+    api_key = "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"
+    url = "https://integrate.api.nvidia.com/v1/chat/completions"
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    body = _json.dumps({
+        "model": "qwen/qwen2.5-coder-7b-instruct",
+        "messages": messages,
+        "max_tokens": 4096,
+        "temperature": 0.2,
+    }).encode()
+    req = urllib.request.Request(url, data=body, headers={
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        result = _json.loads(resp.read())
+    return result["choices"][0]["message"]["content"]
+
+
 def _call_via_anthropic_sdk(
     prompt: str,
     system: str,
@@ -382,7 +406,15 @@ def call_claude(
         log.debug("Text call handled by openclaw CLI")
         return response
 
-    log.info("Neither claude nor openclaw CLI available — falling back to Anthropic SDK")
+    try:
+        response = _call_via_nvidia_nim(prompt, system)
+        if response:
+            log.debug("Text call handled by NVIDIA NIM")
+            return response
+    except Exception as exc:
+        log.debug(f"NVIDIA NIM unavailable: {exc}")
+
+    log.info("Neither claude/openclaw CLI nor NVIDIA NIM available — falling back to Anthropic SDK")
     return _call_via_anthropic_sdk(prompt, system, model)
 
 
