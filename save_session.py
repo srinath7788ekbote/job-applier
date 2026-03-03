@@ -1,4 +1,4 @@
-"""
+﻿"""
 save_session.py
 ───────────────
 One-time utility to save a valid LinkedIn session for use by the pipeline.
@@ -60,25 +60,25 @@ def main():
         print("\nWaiting for login to complete (up to 60s)...")
         print("Complete any 2FA/verification in the browser window.")
 
-        # Wait until we land on feed or a known post-login page
-        for _ in range(60):
+        # Wait until we land on any post-login page (not login/checkpoint)
+        for _ in range(300):
             url = page.url
-            if "/feed" in url or "/in/" in url or "/mynetwork" in url:
+            if not any(x in url for x in ["login", "checkpoint", "challenge", "authwall"]):
                 break
-            if "checkpoint" in url or "challenge" in url:
-                print(f"  → Verification required — complete it in the browser window...")
+            if any(x in url for x in ["checkpoint", "challenge"]):
+                print(f"  -> Verification required — complete it in the browser window...")
             time.sleep(1)
         else:
             print("WARNING: Timed out waiting for login — saving whatever session exists")
 
         # Final check
         if "/feed" in page.url or page.locator(".global-nav__me").count() > 0:
-            print("\n✅ Logged in successfully!")
+            print("\nOK Logged in successfully!")
         else:
-            print(f"\n⚠️  Not sure if logged in (url={page.url}) — saving anyway")
+            print(f"\nWARNING:  Not sure if logged in (url={page.url}) — saving anyway")
 
         _save_linkedin_cookies(context)
-        print(f"✅ Session saved to: {LINKEDIN_SESSION_FILE}")
+        print(f"OK Session saved to: {LINKEDIN_SESSION_FILE}")
         print("\nYou can now run: python main_pipeline.py")
 
         browser.close()
