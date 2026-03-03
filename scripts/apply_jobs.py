@@ -714,26 +714,15 @@ def run_application(
                 li_email    = os.environ.get("LINKEDIN_EMAIL", "").strip()
                 li_password = os.environ.get("LINKEDIN_PASSWORD", "").strip()
 
+                # Try saved cookies only — never attempt automated login.
+                # If cookies are missing/expired, the auth wall will be detected
+                # in apply_linkedin_easy_apply() and handed off to the openclaw agent.
                 if li_email and li_password:
-                    # Try saved cookies first; re-login only if expired/missing
-                    if not _load_linkedin_cookies(context, page):
-                        login_result = login_to_linkedin(page, context, li_email, li_password)
-                        if not login_result["success"]:
-                            reason = login_result.get("reason", "")
-                            if reason == "2fa_required":
-                                return {
-                                    "success": False,
-                                    "method": "linkedin",
-                                    "reason": "2fa_required",
-                                    "error": login_result["error"],
-                                }
-                            # Wrong credentials or unknown — log and continue
-                            # (apply attempt will hit auth wall and be caught below)
-                            log.warning(f"LinkedIn login failed: {login_result.get('error')}")
+                    _load_linkedin_cookies(context, page)
                 else:
                     log.info(
                         "LINKEDIN_EMAIL/PASSWORD not set in .env — "
-                        "proceeding without login (Easy Apply jobs may hit auth wall)"
+                        "proceeding without login (auth wall will trigger agent handoff)"
                     )
                 # ── Apply ────────────────────────────────────────────────────
                 result = apply_linkedin_easy_apply(
