@@ -21,6 +21,7 @@ import logging
 import random
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -231,52 +232,35 @@ def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
     # Read resume text once (used for scoring all jobs)
     resume_text = read_resume_text(str(config.base_resume))
 
-    processed = 0
-    for job in new_jobs:
-        if processed >= config.max_jobs_per_run:
-            break
+    # ------------------------------------------------------------------
+    # Step 4+5 — Score & tailor all qualifying jobs in parallel
+    # ------------------------------------------------------------------
+    log.info(f"Step 4+5: Scoring and tailoring up to {config.max_jobs_per_run} jobs in parallel")
 
+    def score_and_tailor(job: dict) -> dict:
+        """Score a job and tailor resume. Returns enriched job dict."""
+        jid     = job["job_id"]
         title   = job.get("title", "?")
         company = job.get("company", "?")
-        jid     = job["job_id"]
-        log.info(f"--- Processing: {title} @ {company} (id={jid}) ---")
+        _log    = logging.getLogger(f"pipeline.worker.{jid}")
 
-        # Step 4 — Score
-        log.info("Step 4: Scoring job match")
+        _log.info(f"Scoring: {title} @ {company}")
         score_result = score_job(job.get("description", ""), resume_text)
         score = score_result.get("score", 0)
-        log.info(
-            f"Score: {score}/100 — {score_result.get('recommendation', '')} | "
-            f"gaps: {score_result.get('gaps', [])[:2]}"
-        )
+        _log.info(f"Score: {score}/100")
 
         if score < config.min_match_score:
-            log.info(f"Score {score} < threshold {config.min_match_score} — skipping")
-            add_job(str(config.excel_tracker), {
-                **job,
-                "match_score":        score,
-                "strengths":          score_result.get("strengths", []),
-                "gaps":               score_result.get("gaps", []),
-                "keywords_missing":   score_result.get("keywords_missing", []),
-                "tailored_resume_path": "",
-                "status":             STATUS_SKIPPED,
-                "notes":              f"Score below threshold ({score} < {config.min_match_score})",
-            })
-            processed += 1
-            continue
+            return {**job, "match_score": score, "score_result": score_result,
+                    "tailor_result": "", "_skip": True}
 
-        # Step 5 — Tailor resume
-        log.info("Step 5: Tailoring resume with Claude")
-        # Filename: First_Last_Company.pdf
-        name_parts = profile.get("full_name", "Applicant").split()
-        name_slug = "_".join(name_parts)                                      # "Srinath_Ekbote"
+        # Tailor resume
+        name_slug    = "_".join(profile.get("full_name", "Applicant").split())
         safe_company = "_".join(
             w for w in "".join(
                 c if c.isalnum() or c == " " else " " for c in company
             ).split()
-        )[:30]                                                                 # "Halian" (max 30 chars)
-        output_filename = f"{name_slug}_{safe_company}.pdf"
-        output_path = str(config.tailored_resumes_dir / output_filename)
+        )[:30]
+        output_path = str(config.tailored_resumes_dir / f"{name_slug}_{safe_company}.pdf")
 
         try:
             tailor_result = run_resume_skill(
@@ -286,12 +270,57 @@ def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
                 template=config.resume_template,
                 resume_skill_dir=config.resume_skill_vendor,
             )
-            log.info(f"Tailored resume: {tailor_result}")
+            _log.info(f"Tailored resume: {tailor_result}")
         except Exception as exc:
-            log.error(f"Resume tailoring failed: {exc} — using base resume")
+            _log.error(f"Resume tailoring failed: {exc} — using base resume")
             tailor_result = str(config.base_resume)
 
-        # Step 6 — Log to Excel as pending
+        return {**job, "match_score": score, "score_result": score_result,
+                "tailor_result": tailor_result, "_skip": False}
+
+    # Cap at max_jobs_per_run but score/tailor all new jobs in parallel
+    jobs_to_process = new_jobs[:config.max_jobs_per_run]
+    enriched_jobs   = []
+
+    workers = min(len(jobs_to_process), 4)   # cap at 4 parallel workers
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(score_and_tailor, j): j for j in jobs_to_process}
+        for future in as_completed(futures):
+            try:
+                enriched_jobs.append(future.result())
+            except Exception as exc:
+                orig = futures[future]
+                log.error(f"Worker failed for {orig.get('job_id')}: {exc}")
+
+    # ------------------------------------------------------------------
+    # Step 6 — Log to Excel + build handoff list
+    # ------------------------------------------------------------------
+    handoff_jobs = []
+    processed    = 0
+
+    for job in enriched_jobs:
+        jid          = job["job_id"]
+        title        = job.get("title", "?")
+        company      = job.get("company", "?")
+        score        = job["match_score"]
+        score_result = job["score_result"]
+        tailor_result= job.get("tailor_result", "")
+
+        if job.get("_skip"):
+            log.info(f"Skipping {title} @ {company} — score {score} < {config.min_match_score}")
+            add_job(str(config.excel_tracker), {
+                **job,
+                "match_score":          score,
+                "strengths":            score_result.get("strengths", []),
+                "gaps":                 score_result.get("gaps", []),
+                "keywords_missing":     score_result.get("keywords_missing", []),
+                "tailored_resume_path": "",
+                "status":               STATUS_SKIPPED,
+                "notes":                f"Score below threshold ({score} < {config.min_match_score})",
+            })
+            processed += 1
+            continue
+
         add_job(str(config.excel_tracker), {
             **job,
             "match_score":          score,
@@ -310,7 +339,7 @@ def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
 
         # Step 7 — Apply
         log.info(f"Step 7: Applying to {job.get('apply_url')}")
-        resume_to_upload = tailor_result if Path(tailor_result).exists() else str(config.base_resume)
+        resume_to_upload = tailor_result if tailor_result and Path(tailor_result).exists() else str(config.base_resume)
 
         apply_result = run_application(
             job=job,
@@ -326,13 +355,9 @@ def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
         method = apply_result.get("method", "")
         error  = apply_result.get("error") or ""
 
-        # ── Agent handoff required (openclaw running agent) ──────────────────
-        # The pipeline is running under openclaw (no claude -p CLI).
-        # Write a handoff file so the running agent picks it up and applies directly.
+        # ── Agent handoff: collect all into one list ──────────────────────────
         if method == "agent_handoff_required":
-            handoff_path = BASE_DIR / "data" / "agent_handoff.json"
-            handoff_path.parent.mkdir(parents=True, exist_ok=True)
-            handoff = {
+            handoff_jobs.append({
                 "job_id":      jid,
                 "title":       title,
                 "company":     company,
@@ -340,13 +365,10 @@ def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
                 "resume_path": apply_result.get("resume_path", resume_to_upload),
                 "profile":     profile,
                 "tracker":     str(config.excel_tracker),
-            }
-            handoff_path.write_text(json.dumps(handoff, indent=2), encoding="utf-8")
-            status = STATUS_PENDING
-            notes  = f"agent_handoff_required — openclaw agent will apply via playwright-cli. Handoff: {handoff_path}"
-            update_status(str(config.excel_tracker), jid, status, notes)
-            log.info(f"Handoff file written: {handoff_path}")
-            log.info("Openclaw agent will complete this application via playwright-cli")
+            })
+            update_status(str(config.excel_tracker), jid, STATUS_PENDING,
+                          "agent_handoff_required — queued in agent_handoff.json")
+            log.info(f"Queued for agent handoff: {title} @ {company}")
             processed += 1
             continue
 
@@ -374,14 +396,22 @@ def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
 
         update_status(str(config.excel_tracker), jid, status, notes)
         log.info(f"Result: {status} | {notes}")
-
         processed += 1
 
-        # Polite delay between applications (30–60 seconds)
-        if processed < config.max_jobs_per_run and not dry_run:
-            delay = random.uniform(30, 60)
+        # Polite delay between direct applications (5 minutes)
+        if processed < len(enriched_jobs) and not dry_run:
+            delay = random.uniform(300, 330)
             log.info(f"Waiting {delay:.0f}s before next application")
             time.sleep(delay)
+
+    # ------------------------------------------------------------------
+    # Write single agent_handoff.json array (all queued jobs)
+    # ------------------------------------------------------------------
+    if handoff_jobs:
+        handoff_path = BASE_DIR / "data" / "agent_handoff.json"
+        handoff_path.parent.mkdir(parents=True, exist_ok=True)
+        handoff_path.write_text(json.dumps(handoff_jobs, indent=2), encoding="utf-8")
+        log.info(f"agent_handoff.json written with {len(handoff_jobs)} job(s): {[j['title'] for j in handoff_jobs]}")
 
     log.info(f"{'=' * 60}")
     log.info(f"Pipeline complete — {processed} jobs processed")
