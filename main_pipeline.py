@@ -356,6 +356,12 @@ def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
         error  = apply_result.get("error") or ""
 
         # ── Agent handoff: collect all into one list ──────────────────────────
+        # Guard: skip handoff if already applied (pipeline applied it directly)
+        if method == "agent_handoff_required" and job.get("status") == STATUS_APPLIED:
+            log.info(f"Skipping handoff for {title} @ {company} — already applied directly")
+            processed += 1
+            continue
+
         if method == "agent_handoff_required":
             handoff_jobs.append({
                 "job_id":      jid,
