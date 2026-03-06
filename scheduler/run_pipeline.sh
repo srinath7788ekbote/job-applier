@@ -2,7 +2,7 @@
 # run_pipeline.sh — wrapper for cron / launchd / systemd
 # Edit PIPELINE_DIR to match your actual install path.
 
-PIPELINE_DIR="$HOME/.openclaw/workspace/job-applier"
+PIPELINE_DIR="$HOME/projects/job-applier"
 LOG_DIR="$PIPELINE_DIR/logs"
 DATE=$(date +%Y-%m-%d)
 

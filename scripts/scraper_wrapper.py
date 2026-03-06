@@ -10,7 +10,7 @@ import logging
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -118,7 +118,7 @@ def run_scraper(
             log.error(f"Failed to parse scraper JSON: {exc}")
             return []
 
-    scraped_at = datetime.utcnow().isoformat()
+    scraped_at = datetime.now(timezone.utc).isoformat()
     jobs = [_normalize(j, scraped_at) for j in raw_jobs if isinstance(j, dict)]
     log.info(f"Scraper returned {len(jobs)} jobs")
     return jobs

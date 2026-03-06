@@ -3,9 +3,11 @@ claude_client.py
 Unified LLM caller for the job-applier pipeline.
 
 TEXT prompts (profile extraction, scoring, resume tailoring):
-  1. claude CLI     — your Claude Code session, no key needed
-  2. openclaw CLI   — your openclaw session, no key needed
-  3. Anthropic SDK  — ANTHROPIC_API_KEY fallback
+  1. codex CLI      — OpenAI Codex session, no key needed
+  2. claude CLI     — your Claude Code session, no key needed
+  3. openclaw CLI   — your openclaw session, no key needed
+  4. NVIDIA NIM     — NVIDIA_API_KEY
+  5. Anthropic SDK  — ANTHROPIC_API_KEY fallback
 
 VISION prompts (external form screenshot analysis):
   1. Anthropic SDK    — ANTHROPIC_API_KEY
@@ -43,48 +45,54 @@ def _which(cmd: str) -> Optional[str]:
 # Text providers (no image support)
 # ─────────────────────────────────────────────────────────────
 
-def _call_cli(command: str, prompt: str, model: str) -> Optional[str]:
-    """
-    Generic CLI caller for claude or openclaw.
-    Returns response text on success, None on any failure.
-    """
+def _run_cli(args: list[str], prompt: str, stdin_input: str | None = None) -> Optional[str]:
+    """Run a CLI command and return stdout on success, None on failure."""
     env = _clean_env()
-    cmd_path = _which(command)
-    if not cmd_path:
-        return None
-
-    for args in (
-        [cmd_path, "-p", prompt, "--model", model],
-        [cmd_path, "--print", "--model", model],   # stdin variant
-    ):
-        try:
-            stdin_input = prompt if args[-1] == model and "--print" in args else None
-            result = subprocess.run(
-                args,
-                input=stdin_input,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=180,
-                env=env,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-        except Exception as exc:
-            log.debug(f"{command} CLI error: {exc}")
-
+    try:
+        result = subprocess.run(
+            args,
+            input=stdin_input,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+            env=env,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    except Exception as exc:
+        log.debug(f"{args[0]} CLI error: {exc}")
     return None
 
 
+def _call_via_codex_cli(prompt: str, model: str) -> Optional[str]:
+    """Codex CLI: `codex exec "prompt"` with full system access."""
+    cmd = _which("codex")
+    if not cmd:
+        return None
+    return _run_cli([cmd, "exec", "--dangerously-bypass-approvals-and-sandbox", prompt], prompt)
+
+
 def _call_via_claude_cli(prompt: str, model: str) -> Optional[str]:
-    return _call_cli("claude", prompt, model)
+    """Claude CLI: `claude -p "prompt" --model <model>`"""
+    cmd = _which("claude")
+    if not cmd:
+        return None
+    return (
+        _run_cli([cmd, "-p", prompt, "--model", model], prompt)
+        or _run_cli([cmd, "--print", "--model", model], prompt, stdin_input=prompt)
+    )
 
 
 def _call_via_openclaw_cli(prompt: str, model: str) -> Optional[str]:
-    return _call_cli("openclaw", prompt, model)
+    """OpenClaw CLI: `openclaw agent -m "prompt" --local`"""
+    cmd = _which("openclaw")
+    if not cmd:
+        return None
+    return _run_cli([cmd, "agent", "-m", prompt, "--local"], prompt)
 
 
 def _call_via_nvidia_nim(prompt: str, system: str) -> str:
@@ -310,14 +318,25 @@ or if it failed:
 
     env = _clean_env()
 
-    for cli in ("claude", "openclaw"):
-        cmd = _which(cli)
-        if not cmd:
-            continue
+    # Build CLI-specific command args for browser handoff
+    # Codex: full system access + playwright-cli skill
+    # Claude/OpenClaw: standard non-interactive mode
+    cli_commands: list[tuple[str, list[str]]] = []
+    for cli_name, arg_builder in [
+        ("codex",    lambda cmd: [cmd, "exec", "--dangerously-bypass-approvals-and-sandbox", task]),
+        ("claude",   lambda cmd: [cmd, "-p", task]),
+        ("openclaw", lambda cmd: [cmd, "agent", "-m", task, "--local"]),
+    ]:
+        cmd = _which(cli_name)
+        if cmd:
+            cli_commands.append((cli_name, arg_builder(cmd)))
+
+    # Priority: Codex first, then Claude, then OpenClaw
+    for cli_name, args in cli_commands:
         try:
-            log.info(f"Handing external form to {cli} agent browser")
+            log.info(f"Handing external form to {cli_name} agent browser")
             result = subprocess.run(
-                [cmd, "-p", task, "--dangerously-skip-permissions"],
+                args,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -326,13 +345,13 @@ or if it failed:
                 env=env,
             )
             output = (result.stdout or "").strip()
-            log.debug(f"{cli} agent output:\n{output[-500:]}")
+            log.debug(f"{cli_name} agent output:\n{output[-500:]}")
 
             # Extract the last JSON object from the output
             matches = re.findall(r'\{[^{}]*"success"[^{}]*\}', output)
             if matches:
                 parsed = json.loads(matches[-1])
-                log.info(f"Agent browser result: {parsed}")
+                log.info(f"Agent browser result ({cli_name}): {parsed}")
                 return parsed
 
             # No structured JSON — infer from text
@@ -340,16 +359,17 @@ or if it failed:
             if any("success" in l and ("true" in l or ": true" in l) for l in last_lines):
                 return {"success": True, "method": "agent_browser", "error": None}
             if result.returncode != 0:
-                log.warning(f"{cli} agent exited {result.returncode}: {result.stderr[:300]}")
-                continue
-            return {"success": False, "method": "agent_browser",
-                    "error": "Agent completed but returned no structured result"}
+                log.warning(f"{cli_name} agent exited {result.returncode}: {result.stderr[:300]}")
+                continue  # Try next CLI in priority order
+            # CLI exited 0 but no structured result — try next CLI
+            log.warning(f"{cli_name} completed (exit 0) but returned no structured result — trying next CLI")
+            continue
 
         except subprocess.TimeoutExpired:
-            log.warning(f"{cli} agent timed out (5 min) filling form")
-            return {"success": False, "method": "agent_browser", "error": "Agent timed out"}
+            log.warning(f"{cli_name} agent timed out (5 min) — trying next CLI")
+            continue  # Try next CLI instead of giving up entirely
         except Exception as exc:
-            log.debug(f"{cli} agent error: {exc}")
+            log.debug(f"{cli_name} agent error: {exc}")
             continue
 
     return None  # No agent CLI available — caller falls back to vision
@@ -395,8 +415,13 @@ def call_claude(
             f"Attempted providers:\n" + "\n".join(f"  - {e}" for e in errors)
         )
 
-    # Text-only chain
+    # Text-only chain: Codex → Claude → OpenClaw → NVIDIA NIM → Anthropic SDK
     full_prompt = f"{system}\n\n{prompt}" if system else prompt
+
+    response = _call_via_codex_cli(full_prompt, model)
+    if response:
+        log.debug("Text call handled by codex CLI")
+        return response
 
     response = _call_via_claude_cli(full_prompt, model)
     if response:
@@ -416,7 +441,7 @@ def call_claude(
     except Exception as exc:
         log.debug(f"NVIDIA NIM unavailable: {exc}")
 
-    log.info("Neither claude/openclaw CLI nor NVIDIA NIM available — falling back to Anthropic SDK")
+    log.info("No CLI (codex/claude/openclaw) or NVIDIA NIM available — falling back to Anthropic SDK")
     return _call_via_anthropic_sdk(prompt, system, model)
 
 

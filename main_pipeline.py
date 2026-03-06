@@ -41,9 +41,10 @@ sys.path.insert(0, str(BASE_DIR / "scripts"))
 from scraper_wrapper  import run_scraper
 from resume_wrapper   import run_resume_skill
 from extract_profile  import get_profile
-from compare_resume   import score_job, read_resume_text
+from compare_resume   import score_job
+from resume_parser    import read_resume_text
 from update_excel     import (
-    init_tracker, job_exists, add_job, update_status,
+    init_tracker, job_exists, add_job, add_jobs_batch, update_status,
     STATUS_PENDING, STATUS_APPLIED, STATUS_FAILED, STATUS_SKIPPED, STATUS_MANUAL,
 )
 from apply_jobs import run_application
@@ -151,7 +152,9 @@ def setup_logging(logs_dir: Path) -> None:
 # ------------------------------------------------------------------
 # Pipeline
 # ------------------------------------------------------------------
-def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
+def run_pipeline(dry_run: bool = False, overrides: dict | None = None) -> None:
+    if overrides is None:
+        overrides = {}
     config = load_config(BASE_DIR / "config.yaml")
 
     # Apply CLI overrides (any non-None value from argparse replaces config)
@@ -255,12 +258,17 @@ def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
 
         # Tailor resume
         name_slug    = "_".join(profile.get("full_name", "Applicant").split())
+        safe_title   = "_".join(
+            w for w in "".join(
+                c if c.isalnum() or c == " " else " " for c in title
+            ).split()
+        )[:40]
         safe_company = "_".join(
             w for w in "".join(
                 c if c.isalnum() or c == " " else " " for c in company
             ).split()
         )[:30]
-        output_path = str(config.tailored_resumes_dir / f"{name_slug}_{safe_company}.pdf")
+        output_path = str(config.tailored_resumes_dir / f"{name_slug}_{safe_company}_{safe_title}.pdf")
 
         try:
             tailor_result = run_resume_skill(
@@ -293,22 +301,22 @@ def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
                 log.error(f"Worker failed for {orig.get('job_id')}: {exc}")
 
     # ------------------------------------------------------------------
-    # Step 6 — Log to Excel + build handoff list
+    # Step 6 — Log to Excel (batch write) + build handoff list
     # ------------------------------------------------------------------
-    handoff_jobs = []
-    processed    = 0
+    handoff_jobs   = []
+    processed      = 0
+    apply_jobs_list = []
 
+    # Batch-write all enriched jobs to Excel in one open/save cycle
+    batch_rows = []
     for job in enriched_jobs:
-        jid          = job["job_id"]
-        title        = job.get("title", "?")
-        company      = job.get("company", "?")
         score        = job["match_score"]
         score_result = job["score_result"]
         tailor_result= job.get("tailor_result", "")
 
         if job.get("_skip"):
-            log.info(f"Skipping {title} @ {company} — score {score} < {config.min_match_score}")
-            add_job(str(config.excel_tracker), {
+            log.info(f"Skipping {job.get('title', '?')} @ {job.get('company', '?')} — score {score} < {config.min_match_score}")
+            batch_rows.append({
                 **job,
                 "match_score":          score,
                 "strengths":            score_result.get("strengths", []),
@@ -318,18 +326,31 @@ def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
                 "status":               STATUS_SKIPPED,
                 "notes":                f"Score below threshold ({score} < {config.min_match_score})",
             })
+        else:
+            batch_rows.append({
+                **job,
+                "match_score":          score,
+                "strengths":            score_result.get("strengths", []),
+                "gaps":                 score_result.get("gaps", []),
+                "keywords_missing":     score_result.get("keywords_missing", []),
+                "tailored_resume_path": tailor_result,
+                "status":               STATUS_PENDING,
+            })
+            apply_jobs_list.append(job)
+
+    add_jobs_batch(str(config.excel_tracker), batch_rows)
+
+    # Process applications
+    for job in enriched_jobs:
+        jid          = job["job_id"]
+        title        = job.get("title", "?")
+        company      = job.get("company", "?")
+        score        = job["match_score"]
+        tailor_result= job.get("tailor_result", "")
+
+        if job.get("_skip"):
             processed += 1
             continue
-
-        add_job(str(config.excel_tracker), {
-            **job,
-            "match_score":          score,
-            "strengths":            score_result.get("strengths", []),
-            "gaps":                 score_result.get("gaps", []),
-            "keywords_missing":     score_result.get("keywords_missing", []),
-            "tailored_resume_path": tailor_result,
-            "status":               STATUS_PENDING,
-        })
 
         if dry_run:
             log.info(f"DRY RUN: would apply to {job.get('apply_url')}")
@@ -363,18 +384,32 @@ def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
             continue
 
         if method == "agent_handoff_required":
+            # Try CLI agents (Codex/Claude/OpenClaw) for CAPTCHA/auth wall cases
+            from claude_client import call_agent_browser
+            handoff_url = apply_result.get("url", job.get("apply_url", ""))
+            handoff_resume = apply_result.get("resume_path", resume_to_upload)
+            log.info(f"Trying CLI agents for {title} @ {company} (reason: {error})")
+            agent_result = call_agent_browser(handoff_url, handoff_resume, profile)
+            if agent_result and agent_result.get("success"):
+                update_status(str(config.excel_tracker), jid, STATUS_APPLIED,
+                              f"method=agent_browser ({agent_result.get('method', '')})")
+                log.info(f"Agent applied successfully: {title} @ {company}")
+                processed += 1
+                continue
+
+            # Agent failed or unavailable — queue for manual handoff
             handoff_jobs.append({
                 "job_id":      jid,
                 "title":       title,
                 "company":     company,
-                "apply_url":   apply_result.get("url", job.get("apply_url", "")),
-                "resume_path": apply_result.get("resume_path", resume_to_upload),
+                "apply_url":   handoff_url,
+                "resume_path": handoff_resume,
                 "profile":     profile,
                 "tracker":     str(config.excel_tracker),
             })
-            update_status(str(config.excel_tracker), jid, STATUS_PENDING,
+            update_status(str(config.excel_tracker), jid, STATUS_MANUAL,
                           "agent_handoff_required — queued in agent_handoff.json")
-            log.info(f"Queued for agent handoff: {title} @ {company}")
+            log.info(f"Queued for manual handoff: {title} @ {company}")
             processed += 1
             continue
 
@@ -404,9 +439,9 @@ def run_pipeline(dry_run: bool = False, overrides: dict = {}) -> None:
         log.info(f"Result: {status} | {notes}")
         processed += 1
 
-        # Polite delay between direct applications (5 minutes)
+        # Polite delay between direct applications (1 minute)
         if processed < len(enriched_jobs) and not dry_run:
-            delay = random.uniform(300, 330)
+            delay = random.uniform(55, 65)
             log.info(f"Waiting {delay:.0f}s before next application")
             time.sleep(delay)
 

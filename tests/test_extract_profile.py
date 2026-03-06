@@ -32,7 +32,7 @@ def test_parse_profile_from_llm_response(monkeypatch, tmp_path):
     fake_resume = tmp_path / "resume.pdf"
     fake_resume.write_bytes(b"%PDF fake")
     monkeypatch.setattr(extract_profile, "call_claude", lambda *a, **kw: json.dumps(MOCK_PROFILE))
-    monkeypatch.setattr(extract_profile, "_read_resume_text", lambda path: "resume text")
+    monkeypatch.setattr(extract_profile, "read_resume_text", lambda path: "resume text")
     result = extract_profile.extract_profile(str(fake_resume))
     assert result["full_name"] == "Srinath Ekbote"
     assert result["email"] == "ekbotesrinath@gmail.com"
@@ -43,7 +43,7 @@ def test_parse_profile_handles_fenced_json(monkeypatch, tmp_path):
     fake_resume.write_bytes(b"%PDF fake")
     fenced = f"```json\n{json.dumps(MOCK_PROFILE)}\n```"
     monkeypatch.setattr(extract_profile, "call_claude", lambda *a, **kw: fenced)
-    monkeypatch.setattr(extract_profile, "_read_resume_text", lambda path: "resume text")
+    monkeypatch.setattr(extract_profile, "read_resume_text", lambda path: "resume text")
     result = extract_profile.extract_profile(str(fake_resume))
     assert result["full_name"] == "Srinath Ekbote"
 
@@ -52,6 +52,6 @@ def test_parse_profile_handles_bad_response(monkeypatch, tmp_path):
     fake_resume = tmp_path / "resume.pdf"
     fake_resume.write_bytes(b"%PDF fake")
     monkeypatch.setattr(extract_profile, "call_claude", lambda *a, **kw: "not json")
-    monkeypatch.setattr(extract_profile, "_read_resume_text", lambda path: "resume text")
+    monkeypatch.setattr(extract_profile, "read_resume_text", lambda path: "resume text")
     with pytest.raises(Exception):
         extract_profile.extract_profile(str(fake_resume))

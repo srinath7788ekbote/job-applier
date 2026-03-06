@@ -1,4 +1,4 @@
-pipeline:
+﻿pipeline:
   target_role: "Site Reliability Engineer"  # edit this: job title to search
   target_location:                          # edit this: one or more locations
     - "Dubai"
@@ -19,7 +19,7 @@ paths:
   logs_dir: "logs"
 
 playwright:
-  headless: false                           # true = silent; false = visible browser
+  headless: true                            # true = silent headless; false = visible browser
   slow_mo: 50                               # ms between Playwright actions
   min_delay: 1.5                            # seconds between UI actions
   max_delay: 4.0
@@ -29,3 +29,4 @@ playwright:
     - "i'm not a robot"
     - "security check"
     - "prove you're human"
+
