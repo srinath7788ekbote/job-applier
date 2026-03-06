@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from claude_client import call_agent_browser, call_claude, strip_json_fences
+from claude_client import call_claude, strip_json_fences
 from playwright.sync_api import sync_playwright, Page, BrowserContext, Locator
 
 log = logging.getLogger(__name__)
@@ -168,13 +168,26 @@ def _fill_field(page: Page, label: str, value: str) -> bool:
 
 
 def _fill_form_from_profile(page: Page, profile: dict) -> None:
-    """Fill all visible form fields using profile data."""
+    """Fill all visible form fields using profile data.
+
+    Uses the email from the resume profile (not the LinkedIn login email).
+    LinkedIn credentials are only for authentication, never for applications.
+    """
+    # Use resume email for applications, never the LinkedIn login email
+    application_email = profile.get("email", "")
+    li_email = os.environ.get("LINKEDIN_EMAIL", "").strip()
+    if application_email and application_email.lower() == li_email.lower():
+        log.warning(
+            "Profile email matches LINKEDIN_EMAIL — these should be different. "
+            "Job applications should use the email from your resume, not LinkedIn login."
+        )
+
     field_map = {
         "first name":       profile.get("full_name", "").split()[0] if profile.get("full_name") else "",
         "last name":        profile.get("full_name", "").split()[-1] if profile.get("full_name") else "",
         "full name":        profile.get("full_name", ""),
         "name":             profile.get("full_name", ""),
-        "email":            profile.get("email", ""),
+        "email":            application_email,
         "phone":            profile.get("phone", ""),
         "linkedin":         profile.get("linkedin_url", ""),
         "github":           profile.get("github_url", ""),
@@ -383,65 +396,76 @@ def apply_external_form(
     max_delay: float = 4.0,
 ) -> dict:
     """
-    Vision-guided form fill using Claude with a full-page screenshot.
-    Returns dict: {"success": bool, "method": "external_form", "error": str|None}
+    Fill an external job application form using headless Playwright.
+
+    Strategy:
+      1. Navigate to the form URL
+      2. Try vision-guided fill (screenshot + LLM) if an API key is configured
+      3. Fall back to blind fill (profile field matching) if vision unavailable
+      4. Signal agent_handoff_required only for CAPTCHA / auth walls
+
+    Returns dict: {"success": bool, "method": str, "error": str|None}
     """
-    # ── Step 1: Try ambient agent browser (claude / openclaw CLI) ────────────
-    # When running inside Claude Code or openclaw, the agent can browse and fill
-    # the form natively using its own tools — no vision API key needed.
-    log.info("Attempting agent browser handoff (claude/openclaw CLI)")
-    agent_result = call_agent_browser(apply_url, resume_path, profile)
-    if agent_result is not None:
-        # Agent CLI was available and handled the task (success or failure)
-        log.info(f"Agent browser result: {agent_result}")
-        return agent_result
-
-    # ── No agent CLI available ─────────────────────────────────────────────────
-    # Signal back to the pipeline that a running agent (e.g. openclaw) should
-    # handle this form directly using its own browser tools.
-    # main_pipeline.py will write a handoff file and the agent picks it up.
-    log.info("No agent CLI available — signalling agent_handoff_required")
-    return {
-        "success": False,
-        "method": "agent_handoff_required",
-        "url": apply_url,
-        "resume_path": resume_path,
-        "error": None,
-    }
-
-    # ── Step 2: Vision-guided Playwright fill ─────────────────────────────────
-    # No agent CLI available — fall back to screenshot + vision model
-    # NOTE: unreachable when agent_handoff_required is returned above.
-    # Kept for reference / future use with a vision API key.
-    log.info("No agent CLI available — using vision-guided Playwright fill")
     log.info(f"Navigating to external form: {apply_url}")
     page.goto(apply_url, wait_until="domcontentloaded", timeout=60000)
     human_delay(min_delay, max_delay)
 
     if _detect_captcha(page):
-        return {"success": False, "method": "external_form",
-                "error": "CAPTCHA detected — apply manually"}
+        return _signal_handoff(apply_url, resume_path, "CAPTCHA detected on external form")
 
     if _detect_linkedin_auth_wall(page):
-        return {"success": False, "method": "external_form", "reason": "linkedin_auth_required",
-                "error": "LinkedIn sign-in wall — browser session not authenticated"}
+        return _signal_handoff(apply_url, resume_path, "LinkedIn sign-in wall on external form")
 
-    # Scroll down to load lazy form elements
+    # If the URL is still a LinkedIn page (no real external form), skip direct fill
+    if "linkedin.com" in page.url:
+        log.info("External URL resolved to LinkedIn — handing off to CLI agent")
+        return _signal_handoff(apply_url, resume_path, "No external form found — LinkedIn page")
+
+    # Scroll to load lazy form elements
     page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
     human_delay(0.5, 1.0)
 
-    # Screenshot → base64
-    screenshot_bytes = page.screenshot(full_page=True)
-    screenshot_b64 = base64.standard_b64encode(screenshot_bytes).decode()
+    # ── Try vision-guided fill (screenshot + LLM) ────────────────────────────
+    vision_result = _try_vision_fill(page, apply_url, resume_path, profile)
+    if vision_result is not None:
+        return vision_result
 
+    # ── Fallback: blind fill from profile fields ─────────────────────────────
+    log.info("Vision unavailable — using blind form fill from profile")
+    return _blind_fill(page, resume_path, profile)
+
+
+def _signal_handoff(apply_url: str, resume_path: str, reason: str) -> dict:
+    """Signal that an agent should handle this form (CAPTCHA / auth wall)."""
+    log.info(f"Agent handoff required: {reason}")
+    return {
+        "success": False,
+        "method": "agent_handoff_required",
+        "url": apply_url,
+        "resume_path": resume_path,
+        "error": reason,
+    }
+
+
+def _try_vision_fill(
+    page: Page,
+    apply_url: str,
+    resume_path: str,
+    profile: dict,
+) -> Optional[dict]:
+    """Screenshot the form, send to vision LLM, execute returned actions.
+
+    Returns a result dict on success/failure, or None if no vision LLM is available.
+    """
     profile_json = json.dumps({
         k: v for k, v in profile.items()
         if k in ("full_name", "email", "phone", "linkedin_url", "github_url",
                   "location", "work_authorization", "years_of_experience", "current_title")
     }, indent=2)
 
-    # Vision call — requires Anthropic SDK (image input). If unavailable, do a blind fill.
-    actions = None
+    screenshot_bytes = page.screenshot(full_page=True)
+    screenshot_b64 = base64.standard_b64encode(screenshot_bytes).decode()
+
     prompt = (
         "Here is a screenshot of a job application form. "
         "Based on the applicant profile below, return ONLY a JSON array of actions "
@@ -460,49 +484,13 @@ def apply_external_form(
             image_b64=screenshot_b64,
         )
         actions = json.loads(strip_json_fences(raw))
-        log.info(f"Claude returned {len(actions)} form actions")
+        log.info(f"Vision LLM returned {len(actions)} form actions")
     except Exception as exc:
-        log.warning(
-            f"Vision-based form analysis unavailable ({exc}). "
-            "Falling back to blind field fill (no API key / vision not supported by CLI). "
-            "Set ANTHROPIC_API_KEY in .env to enable vision-guided form filling."
-        )
-        # Blind fill: fill common fields by label, upload resume, click submit
-        _fill_form_from_profile(page, profile)
-        try:
-            file_input = page.locator('input[type="file"]').first
-            file_input.set_input_files(resume_path)
-            human_delay(1.0, 2.0)
-        except Exception:
-            pass
-        for submit_label in ["Submit", "Apply Now", "Apply", "Submit Application"]:
-            btn = page.locator(f'button:has-text("{submit_label}"), input[value="{submit_label}"]')
-            if btn.count() > 0 and btn.first.is_visible():
-                human_click(page, btn.first)
-                human_delay(2.0, 3.0)
-                break
-        human_delay(2.0, 4.0)
-        page_text = ""
-        try:
-            page_text = page.inner_text("body").lower()
-        except Exception:
-            pass
-        success_keywords = ["application submitted", "thank you for applying", "successfully applied",
-                            "application received", "we'll be in touch"]
-        success = any(kw in page_text for kw in success_keywords)
-        if not success:
-            return {"success": False, "method": "external_form",
-                    "error": "Vision unavailable — blind fill attempted. Add ANTHROPIC_API_KEY to .env for full support. Mark as manual_required."}
-        return {"success": True, "method": "external_form_blind", "error": None}
-
-    if actions is None:
-        return {"success": False, "method": "external_form",
-                "error": "No form actions returned"}
-
-    log.info(f"Claude returned {len(actions)} form actions")
+        log.warning(f"Vision-based form analysis unavailable ({exc})")
+        return None  # Caller falls back to blind fill
 
     for action in actions:
-        act  = action.get("action", "")
+        act   = action.get("action", "")
         label = action.get("label", "")
         value = action.get("value", "")
         try:
@@ -530,10 +518,38 @@ def apply_external_form(
             log.warning(f"Action failed [{act} '{label}']: {exc}")
 
     human_delay(2.0, 4.0)
+    return _check_submission(page, "external_form")
 
-    # Check for confirmation
+
+def _blind_fill(page: Page, resume_path: str, profile: dict) -> dict:
+    """Fill form fields by matching profile keys to common labels, then submit."""
+    _fill_form_from_profile(page, profile)
+
+    # Upload resume if file input exists
+    try:
+        file_input = page.locator('input[type="file"]').first
+        if file_input.count() > 0:
+            file_input.set_input_files(resume_path)
+            human_delay(1.0, 2.0)
+    except Exception:
+        pass
+
+    # Click submit
+    for submit_label in ["Submit", "Apply Now", "Apply", "Submit Application", "Send Application"]:
+        btn = page.locator(f'button:has-text("{submit_label}"), input[value="{submit_label}"]')
+        if btn.count() > 0 and btn.first.is_visible():
+            human_click(page, btn.first)
+            human_delay(2.0, 3.0)
+            break
+
+    human_delay(2.0, 4.0)
+    return _check_submission(page, "external_form_blind")
+
+
+def _check_submission(page: Page, method: str) -> dict:
+    """Check page for CAPTCHA or success confirmation after submit."""
     if _detect_captcha(page):
-        return {"success": False, "method": "external_form",
+        return {"success": False, "method": method,
                 "error": "CAPTCHA appeared after submit — apply manually"}
 
     page_text = ""
@@ -545,11 +561,19 @@ def apply_external_form(
     success_keywords = [
         "application submitted", "thank you for applying", "successfully applied",
         "application received", "we'll be in touch", "application complete",
+        "thank you for your interest", "application has been received",
+        "we have received your application", "your application has been submitted",
+        "thanks for applying", "successfully submitted",
     ]
-    success = any(kw in page_text for kw in success_keywords)
+    # Also check URL for common confirmation patterns
+    current_url = page.url.lower()
+    url_success = any(kw in current_url for kw in [
+        "thank", "success", "confirm", "submitted", "complete",
+    ])
+    success = any(kw in page_text for kw in success_keywords) or url_success
     return {
         "success": success,
-        "method": "external_form",
+        "method": method,
         "error": None if success else "No confirmation text detected after submit",
     }
 

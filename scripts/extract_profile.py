@@ -8,20 +8,16 @@ Only call get_profile() from outside this module — never extract_profile() dir
 
 import json
 import logging
-import sys
 from pathlib import Path
 
 from claude_client import call_claude, strip_json_fences
+from resume_parser import read_resume_text
 
 log = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent.parent
-RESUME_SKILL_DIR = BASE_DIR / "vendor" / "resume-skill"
 CACHE_FILE = BASE_DIR / "data" / "profile_cache.json"
 CACHE_META = BASE_DIR / "data" / "profile_cache.meta.json"
-
-if str(RESUME_SKILL_DIR) not in sys.path:
-    sys.path.insert(0, str(RESUME_SKILL_DIR))
 
 PROFILE_SCHEMA = """{
   "full_name": "string or null",
@@ -42,33 +38,12 @@ PROFILE_SCHEMA = """{
 }"""
 
 
-def _read_resume_text(resume_path: str) -> str:
-    """Extract plain text from resume using resume_skill's parser with fallback."""
-    try:
-        from parse import extract_text
-        return extract_text(resume_path)
-    except Exception as exc:
-        log.warning(f"vendor parse.py failed ({exc}), using fallback")
-
-    path = Path(resume_path)
-    suffix = path.suffix.lower()
-    if suffix == ".docx":
-        from docx import Document
-        doc = Document(str(path))
-        return "\n".join(p.text for p in doc.paragraphs)
-    elif suffix == ".pdf":
-        import pdfplumber
-        with pdfplumber.open(str(path)) as pdf:
-            return "\n".join(page.extract_text() or "" for page in pdf.pages)
-    return path.read_text(encoding="utf-8", errors="ignore")
-
-
 def extract_profile(resume_path: str) -> dict:
     """
     Send resume text to Claude and extract structured profile JSON.
     Do not call this directly — use get_profile() for caching.
     """
-    resume_text = _read_resume_text(resume_path)
+    resume_text = read_resume_text(resume_path)
 
     system = (
         "You are a resume parser. Extract all applicant information from the resume "

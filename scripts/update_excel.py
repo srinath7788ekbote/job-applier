@@ -11,7 +11,7 @@ Columns (fixed order):
 import logging
 import shutil
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import openpyxl
@@ -135,37 +135,46 @@ def _list_to_str(value) -> str:
 
 def add_job(path: str, job_dict: dict) -> None:
     """Append a new job row. Lists are stored as semicolon-separated strings."""
+    add_jobs_batch(path, [job_dict])
+
+
+def add_jobs_batch(path: str, job_dicts: list[dict]) -> None:
+    """Append multiple job rows in a single file open/save cycle."""
+    if not job_dicts:
+        return
     wb = openpyxl.load_workbook(path)
     ws = wb.active
 
-    status = job_dict.get("status", STATUS_PENDING)
-    fill_color = STATUS_COLORS.get(status, "FFFFFF")
-    fill = PatternFill("solid", fgColor=fill_color)
+    for job_dict in job_dicts:
+        status = job_dict.get("status", STATUS_PENDING)
+        fill_color = STATUS_COLORS.get(status, "FFFFFF")
+        fill = PatternFill("solid", fgColor=fill_color)
 
-    row_data = {
-        "job_id":              job_dict.get("job_id", ""),
-        "title":               job_dict.get("title", ""),
-        "company":             job_dict.get("company", ""),
-        "location":            job_dict.get("location", ""),
-        "apply_url":           job_dict.get("apply_url", ""),
-        "match_score":         job_dict.get("match_score", ""),
-        "strengths":           _list_to_str(job_dict.get("strengths", [])),
-        "gaps":                _list_to_str(job_dict.get("gaps", [])),
-        "keywords_missing":    _list_to_str(job_dict.get("keywords_missing", [])),
-        "tailored_resume_path": job_dict.get("tailored_resume_path", ""),
-        "status":              status,
-        "scraped_at":          job_dict.get("scraped_at", ""),
-        "applied_at":          "",
-        "notes":               job_dict.get("notes", ""),
-    }
+        row_data = {
+            "job_id":              job_dict.get("job_id", ""),
+            "title":               job_dict.get("title", ""),
+            "company":             job_dict.get("company", ""),
+            "location":            job_dict.get("location", ""),
+            "apply_url":           job_dict.get("apply_url", ""),
+            "match_score":         job_dict.get("match_score", ""),
+            "strengths":           _list_to_str(job_dict.get("strengths", [])),
+            "gaps":                _list_to_str(job_dict.get("gaps", [])),
+            "keywords_missing":    _list_to_str(job_dict.get("keywords_missing", [])),
+            "tailored_resume_path": job_dict.get("tailored_resume_path", ""),
+            "status":              status,
+            "scraped_at":          job_dict.get("scraped_at", ""),
+            "applied_at":          "",
+            "notes":               job_dict.get("notes", ""),
+        }
 
-    new_row = ws.max_row + 1
-    for col_name, value in row_data.items():
-        cell = ws.cell(row=new_row, column=_col_index(col_name), value=value)
-        cell.fill = fill
+        new_row = ws.max_row + 1
+        for col_name, value in row_data.items():
+            cell = ws.cell(row=new_row, column=_col_index(col_name), value=value)
+            cell.fill = fill
+
+        log.debug(f"Added job {row_data['job_id']} to tracker")
 
     _safe_save(wb, path)
-    log.debug(f"Added job {row_data['job_id']} to tracker")
 
 
 def _find_workbook_with_job(path: str, job_id: str) -> str:
@@ -213,7 +222,7 @@ def update_status(
     for row in ws.iter_rows(min_row=2):
         if row[id_col - 1].value == job_id:
             row[st_col - 1].value = status
-            row[at_col - 1].value = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            row[at_col - 1].value = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             row[nt_col - 1].value = notes
             # Apply color to entire row
             for cell in row:

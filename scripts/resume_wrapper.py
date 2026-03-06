@@ -20,14 +20,12 @@ from pathlib import Path
 from typing import Optional
 
 from claude_client import call_claude, strip_json_fences
+from resume_parser import read_resume_text
 
 log = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent.parent
 RESUME_SKILL_DIR = BASE_DIR / "vendor" / "resume-skill"
-
-if str(RESUME_SKILL_DIR) not in sys.path:
-    sys.path.insert(0, str(RESUME_SKILL_DIR))
 
 
 def _get_resume_skill_constants() -> tuple[str, str]:
@@ -45,28 +43,6 @@ def _get_resume_skill_constants() -> tuple[str, str]:
         return "", ""
 
 
-def _extract_resume_text(resume_path: str) -> str:
-    """Use resume_skill's parse.py to extract text from docx/pdf."""
-    try:
-        from parse import extract_text
-        return extract_text(resume_path)
-    except Exception as exc:
-        log.warning(f"resume_skill parse.py failed ({exc}), falling back")
-        return _fallback_extract(resume_path)
-
-
-def _fallback_extract(resume_path: str) -> str:
-    path = Path(resume_path)
-    suffix = path.suffix.lower()
-    if suffix == ".docx":
-        from docx import Document
-        doc = Document(str(path))
-        return "\n".join(p.text for p in doc.paragraphs)
-    elif suffix == ".pdf":
-        import pdfplumber
-        with pdfplumber.open(str(path)) as pdf:
-            return "\n".join(page.extract_text() or "" for page in pdf.pages)
-    return path.read_text(encoding="utf-8", errors="ignore")
 
 
 def run_resume_skill(
@@ -84,7 +60,7 @@ def run_resume_skill(
     python = sys.executable
 
     log.info(f"Extracting resume text from {base_resume_path}")
-    resume_text = _extract_resume_text(base_resume_path)
+    resume_text = read_resume_text(base_resume_path)
 
     ats_rules, schema = _get_resume_skill_constants()
 

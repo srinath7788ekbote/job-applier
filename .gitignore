@@ -23,6 +23,9 @@ data/linkedin_session.json
 # Excel tracker (personal data — generated per run)
 data/jobs_tracker.xlsx
 data/jobs_tracker_*.xlsx
+data/agent_handoff.json
+data/applied_jobs.json
+data/linkedin_state.json
 
 # Python
 __pycache__/
