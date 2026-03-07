@@ -8,7 +8,7 @@ import json
 import logging
 from pathlib import Path
 
-from claude_client import call_claude, strip_json_fences
+from claude_client import call_llm, strip_json_fences
 from resume_parser import read_resume_text
 
 log = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ def score_job(job_description: str, resume_text: str) -> dict:
     )
 
     try:
-        raw = call_claude(prompt, system=system)
+        raw = call_llm(prompt, system=system)
         result = json.loads(strip_json_fences(raw))
         result.setdefault("score", 0)
         result.setdefault("strengths", [])

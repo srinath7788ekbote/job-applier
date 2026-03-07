@@ -34,7 +34,7 @@ def test_call_claude_uses_nvidia_nim_when_cli_unavailable(monkeypatch):
     monkeypatch.setattr(claude_client, "_call_via_openclaw_cli", lambda *a: None)
     monkeypatch.setattr(claude_client, "_call_via_nvidia_nim", lambda *a: "NIM response")
 
-    result = claude_client.call_claude("test prompt")
+    result = claude_client.call_llm("test prompt")
     assert result == "NIM response"
 
 
@@ -45,7 +45,7 @@ def test_call_claude_prefers_codex_cli(monkeypatch):
     monkeypatch.setattr(claude_client, "_call_via_openclaw_cli", lambda *a: "openclaw response")
     monkeypatch.setattr(claude_client, "_call_via_nvidia_nim", lambda *a: "NIM response")
 
-    result = claude_client.call_claude("test prompt")
+    result = claude_client.call_llm("test prompt")
     assert result == "codex response"
 
 
@@ -56,7 +56,7 @@ def test_call_claude_falls_back_to_claude_when_codex_unavailable(monkeypatch):
     monkeypatch.setattr(claude_client, "_call_via_openclaw_cli", lambda *a: "openclaw response")
     monkeypatch.setattr(claude_client, "_call_via_nvidia_nim", lambda *a: "NIM response")
 
-    result = claude_client.call_claude("test prompt")
+    result = claude_client.call_llm("test prompt")
     assert result == "CLI response"
 
 
@@ -68,7 +68,7 @@ def test_call_claude_falls_back_to_anthropic_sdk(monkeypatch):
     monkeypatch.setattr(claude_client, "_call_via_nvidia_nim", lambda *a: (_ for _ in ()).throw(RuntimeError("NIM down")))
     monkeypatch.setattr(claude_client, "_call_via_anthropic_sdk", lambda *a, **kw: "SDK response")
 
-    result = claude_client.call_claude("test prompt")
+    result = claude_client.call_llm("test prompt")
     assert result == "SDK response"
 
 

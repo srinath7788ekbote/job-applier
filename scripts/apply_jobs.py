@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from claude_client import call_claude, strip_json_fences
+from claude_client import call_llm, strip_json_fences
 from playwright.sync_api import sync_playwright, Page, BrowserContext, Locator
 
 log = logging.getLogger(__name__)
@@ -478,7 +478,7 @@ def _try_vision_fill(
         "Return only the JSON array."
     )
     try:
-        raw = call_claude(
+        raw = call_llm(
             prompt,
             system="You are helping fill out a job application form.",
             image_b64=screenshot_b64,
