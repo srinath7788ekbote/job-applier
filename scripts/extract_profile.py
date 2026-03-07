@@ -10,7 +10,7 @@ import json
 import logging
 from pathlib import Path
 
-from claude_client import call_claude, strip_json_fences
+from claude_client import call_llm, strip_json_fences
 from resume_parser import read_resume_text
 
 log = logging.getLogger(__name__)
@@ -57,7 +57,7 @@ def extract_profile(resume_path: str) -> dict:
         f"Resume text:\n{resume_text}"
     )
 
-    raw = call_claude(prompt, system=system)
+    raw = call_llm(prompt, system=system)
     profile = json.loads(strip_json_fences(raw))
     log.info(f"Profile extracted for: {profile.get('full_name', 'Unknown')}")
     return profile

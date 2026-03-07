@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from claude_client import call_claude, strip_json_fences
+from claude_client import call_llm, strip_json_fences
 from resume_parser import read_resume_text
 
 log = logging.getLogger(__name__)
@@ -65,41 +65,52 @@ def run_resume_skill(
     ats_rules, schema = _get_resume_skill_constants()
 
     system = (
-        "You are an expert resume writer and ATS optimization specialist. "
-        "Your task is to tailor a resume to a specific job description. "
-        "You must follow the ATS rules provided exactly. "
+        "You are an expert technical resume writer and ATS optimization specialist. "
+        "Your task is to tailor an IT engineering professional's resume to a specific job description. "
+        "You must follow the ATS and formatting rules provided exactly. "
         "Return ONLY a valid JSON object matching the schema — no markdown fences, "
         "no explanation, no extra text. Every field must be present."
     )
 
-    HARD_RULES = """
+    RULES = """
 === ABSOLUTE HARD RULES — NEVER VIOLATE THESE ===
 These fields must be copied EXACTLY from the original resume. Do NOT change, rephrase, embellish, or add subtitles to any of them:
-
 1. FULL NAME — copy exactly as written
 2. EMAIL — copy exactly as written
 3. PHONE — copy exactly as written
 4. LINKEDIN URL — copy exactly as written
-5. GITHUB URL — copy exactly as written
-6. JOB TITLES — copy the exact title the person held at each company (e.g. "Site Reliability Engineer"). Never append subtitles, specializations, or descriptors like "— Data Platform Operations". The title must match the original word-for-word.
-7. COMPANY NAMES — copy exactly as written (including client names in parentheses)
-8. EMPLOYMENT DATES — copy exactly as written (start and end months/years)
-9. EDUCATION — degree names, field of study, institution names, and graduation years must be copied exactly
+5. GITHUB URL/PORTFOLIO — copy exactly as written
+6. JOB TITLES — copy the exact title held at each company. Never append subtitles, specializations, or descriptors.
+7. COMPANY NAMES — copy exactly as written
+8. EMPLOYMENT DATES — copy exactly as written
+9. EDUCATION — degree names, field of study, institution names, graduation years
 10. CERTIFICATIONS — copy names and codes exactly as written
 
+=== ANTI-AI DETECTION & TONE RULES ===
+To bypass AI detectors and appeal to engineering hiring managers, you must strictly adhere to this writing style:
+1. BAN LIST: Never use the following words: delve, spearhead, synergize, testament, dynamic, multifaceted, elevate, seamless, pivotal, landscape, navigate, foster, unlock, unleash, transformative.
+2. TONE: Write in a terse, direct, highly technical, and objective tone. Do not use filler words, adverbs, or subjective adjectives (e.g., "successfully," "expertly," "impressive," "cutting-edge").
+3. METRICS: You must preserve the original metrics, percentages, data volumes, and time-savings EXACTLY as they appear. Never invent or estimate new numbers.
+4. BULLET STRUCTURE: Keep bullet points under 2 lines. Start strictly with a strong past-tense engineering verb (e.g., Architected, Engineered, Developed, Migrated, Deployed, Automated, Optimized).
+
+=== ATS OPTIMIZATION RULES ===
+1. EXACT MATCHING: Identify hard technical skills in the Job Description (e.g., programming languages, frameworks, databases, cloud providers, infrastructure tools). If the candidate possesses these skills based on the original resume, mirror the EXACT terminology and acronyms used in the JD.
+2. NO KEYWORD STUFFING: Integrate JD keywords naturally into the existing experience bullets and skills section. Do not arbitrarily list keywords out of context.
+
 What you MAY change to tailor to the JD:
-- The summary paragraph (reframe tone/focus, never change factual claims)
-- Key achievements section (reorder, rename labels, adjust wording — never invent new metrics)
-- Skills section (reorder categories, rename category labels, reorder items within categories)
-- Experience bullet points (reorder bullets, adjust emphasis, add relevant context — never invent actions or metrics not in the original)
+- Summary paragraph (reframe focus toward JD priorities, utilizing JD terminology, never change factual claims)
+- Key achievements section (reorder based on JD relevance, adjust wording to highlight JD-specific technologies)
+- Skills section (reorder categories, rename category labels to match JD, reorder items)
+- Experience bullet points (reorder to put the most JD-relevant bullets first, adjust context to highlight overlapping technologies — never invent experience)
+- layout_order array: define the strategic section order based on JD relevance and candidate strengths (e.g., if the JD emphasizes project experience, move "projects" above "experience"; push "awards" to the bottom for senior candidates)
 
 If a field is not in the resume, set it to null. Never invent content.
-=== END HARD RULES ===
+=== END RULES ===
 """
 
     prompt = (
         f"Tailor this resume to the job description below.\n\n"
-        f"{HARD_RULES}\n"
+        f"{RULES}\n"
         f"=== ATS RULES ===\n{ats_rules}\n\n"
         f"=== JSON SCHEMA ===\n{schema}\n\n"
         f"=== CURRENT RESUME TEXT ===\n{resume_text}\n\n"
@@ -107,8 +118,8 @@ If a field is not in the resume, set it to null. Never invent content.
         "Return ONLY the JSON object."
     )
 
-    log.info("Calling Claude to tailor resume JSON")
-    raw = call_claude(prompt, system=system)
+    log.info("Calling LLM to tailor resume JSON")
+    raw = call_llm(prompt, system=system)
     tailored_data = json.loads(strip_json_fences(raw))
 
     with tempfile.NamedTemporaryFile(

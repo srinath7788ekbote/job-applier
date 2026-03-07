@@ -375,7 +375,7 @@ or if it failed:
     return None  # No agent CLI available — caller falls back to vision
 
 
-def call_claude(
+def call_llm(
     prompt: str,
     system: str = "",
     model: str = DEFAULT_MODEL,
@@ -443,6 +443,9 @@ def call_claude(
 
     log.info("No CLI (codex/claude/openclaw) or NVIDIA NIM available — falling back to Anthropic SDK")
     return _call_via_anthropic_sdk(prompt, system, model)
+
+
+call_claude = call_llm  # backward compat alias
 
 
 def strip_json_fences(text: str) -> str:
