@@ -55,7 +55,7 @@ from apply_jobs import run_application
 # ------------------------------------------------------------------
 @dataclass
 class Config:
-    target_role:          str
+    target_role:          list
     target_location:      list
     target_platforms:     list
     max_jobs_per_run:     int
@@ -87,8 +87,12 @@ def load_config(config_path: Path) -> Config:
     if isinstance(location, str):
         location = [location]
 
+    role = pipe["target_role"]
+    if isinstance(role, str):
+        role = [role]
+
     return Config(
-        target_role=pipe["target_role"],
+        target_role=role,
         target_location=location,
         target_platforms=pipe.get("target_platforms", ["linkedin"]),
         max_jobs_per_run=pipe["max_jobs_per_run"],
@@ -159,7 +163,8 @@ def run_pipeline(dry_run: bool = False, overrides: dict | None = None) -> None:
 
     # Apply CLI overrides (any non-None value from argparse replaces config)
     if overrides.get("role"):
-        config.target_role = overrides["role"]
+        role_val = overrides["role"]
+        config.target_role = role_val if isinstance(role_val, list) else [role_val]
     if overrides.get("location"):
         config.target_location = overrides["location"]
     if overrides.get("days") is not None:
@@ -206,17 +211,27 @@ def run_pipeline(dry_run: bool = False, overrides: dict | None = None) -> None:
         log.error(f"Profile extraction failed: {exc}")
         return
 
-    # Step 2 — Scrape jobs
+    # Step 2 — Scrape jobs (loop over all target roles, dedup by job_id)
     log.info("Step 2: Scraping jobs")
-    jobs = run_scraper(
-        role=config.target_role,
-        locations=config.target_location,
-        limit=config.max_jobs_per_run * 3,   # scrape more, filter down
-        days=config.days_back,
-        platforms=config.target_platforms,
-        scraper_dir=config.scraper_vendor,
-    )
-    log.info(f"Scraped {len(jobs)} jobs total")
+    jobs: list[dict] = []
+    seen_ids: set[str] = set()
+    for role in config.target_role:
+        log.info(f"Scraping for role: {role}")
+        role_jobs = run_scraper(
+            role=role,
+            locations=config.target_location,
+            limit=config.max_jobs_per_run * 3,   # scrape more, filter down
+            days=config.days_back,
+            platforms=config.target_platforms,
+            scraper_dir=config.scraper_vendor,
+        )
+        for j in role_jobs:
+            jid = j["job_id"]
+            if jid not in seen_ids:
+                seen_ids.add(jid)
+                jobs.append(j)
+        log.info(f"  {role}: {len(role_jobs)} scraped, {len(jobs)} unique total")
+    log.info(f"Scraped {len(jobs)} unique jobs across {len(config.target_role)} role(s)")
 
     if not jobs:
         log.warning("No jobs scraped — check scraper logs or network")
@@ -478,14 +493,17 @@ Examples:
   # Override role and location
   python main_pipeline.py --role "DevOps Engineer" --location Dubai "Abu Dhabi"
 
+  # Multiple roles
+  python main_pipeline.py --role "SRE" "DevOps Engineer" --location Dubai Sydney
+
   # Full override
-  python main_pipeline.py --role "SRE" --location Dubai --days 3 \\
+  python main_pipeline.py --role "SRE" "DevOps" --location Dubai --days 3 \\
       --platform linkedin --max-jobs 5 --min-score 65 \\
       --template modern --resume data/my_resume.pdf
         """,
     )
     parser.add_argument("--dry-run",   action="store_true",  help="Score and tailor but do not apply")
-    parser.add_argument("--role",      type=str,             help="Job title / keyword to search")
+    parser.add_argument("--role",      nargs="+",            help="One or more job titles / keywords to search")
     parser.add_argument("--location",  nargs="+",            help="One or more locations")
     parser.add_argument("--days",      type=int,             help="Only jobs posted in last N days")
     parser.add_argument("--platform",  nargs="+",            choices=["linkedin", "glassdoor", "naukri"],
