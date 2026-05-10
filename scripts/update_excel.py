@@ -118,10 +118,13 @@ def job_exists(path: str, job_id: str) -> bool:
     """Return True if job_id is already in column A."""
     try:
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        ws = wb.active
-        for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
-            if row[0] == job_id:
-                return True
+        try:
+            ws = wb.active
+            for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
+                if row[0] == job_id:
+                    return True
+        finally:
+            wb.close()
     except Exception:
         pass
     return False

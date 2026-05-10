@@ -399,7 +399,7 @@ def run_pipeline(dry_run: bool = False, overrides: dict | None = None) -> None:
             continue
 
         if method == "agent_handoff_required":
-            # Try CLI agents (Codex/Claude/OpenClaw) for CAPTCHA/auth wall cases
+            # Try claude CLI agent for CAPTCHA/auth wall cases
             from claude_client import call_agent_browser
             handoff_url = apply_result.get("url", job.get("apply_url", ""))
             handoff_resume = apply_result.get("resume_path", resume_to_upload)

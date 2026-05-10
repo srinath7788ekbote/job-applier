@@ -1,20 +1,12 @@
 """
 claude_client.py
-Unified LLM caller for the job-applier pipeline.
+LLM caller for the job-applier pipeline.
 
-TEXT prompts (profile extraction, scoring, resume tailoring):
-  1. codex CLI      — OpenAI Codex session, no key needed
-  2. claude CLI     — your Claude Code session, no key needed
-  3. openclaw CLI   — your openclaw session, no key needed
-  4. NVIDIA NIM     — NVIDIA_API_KEY
-  5. Anthropic SDK  — ANTHROPIC_API_KEY fallback
-
-VISION prompts (external form screenshot analysis):
-  1. Anthropic SDK    — ANTHROPIC_API_KEY
-  2. Gemini API       — GEMINI_API_KEY
-  3. GitHub Copilot   — GITHUB_TOKEN (OpenAI-compatible endpoint)
+Uses claude CLI exclusively for all AI tasks.
+No API keys required — runs inside a Claude Code session.
 """
 
+import json
 import logging
 import os
 import subprocess
@@ -22,15 +14,15 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-opus-4-6"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 
 def _clean_env() -> dict:
-    """Strip CLAUDECODE so subprocesses can call the claude/openclaw CLI freely."""
+    """Strip CLAUDECODE so subprocesses can call the claude CLI freely."""
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
     return env
@@ -41,9 +33,9 @@ def _which(cmd: str) -> Optional[str]:
     return shutil.which(cmd) or shutil.which(f"{cmd}.cmd")
 
 
-# ─────────────────────────────────────────────────────────────
-# Text providers (no image support)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
+# Provider
+# ─────────────────────────────────────────────────────────
 
 def _run_cli(args: list[str], prompt: str, stdin_input: str | None = None) -> Optional[str]:
     """Run a CLI command and return stdout on success, None on failure."""
@@ -68,14 +60,6 @@ def _run_cli(args: list[str], prompt: str, stdin_input: str | None = None) -> Op
     return None
 
 
-def _call_via_codex_cli(prompt: str, model: str) -> Optional[str]:
-    """Codex CLI: `codex exec "prompt"` with full system access."""
-    cmd = _which("codex")
-    if not cmd:
-        return None
-    return _run_cli([cmd, "exec", "--dangerously-bypass-approvals-and-sandbox", prompt], prompt)
-
-
 def _call_via_claude_cli(prompt: str, model: str) -> Optional[str]:
     """Claude CLI: `claude -p "prompt" --model <model>`"""
     cmd = _which("claude")
@@ -87,154 +71,9 @@ def _call_via_claude_cli(prompt: str, model: str) -> Optional[str]:
     )
 
 
-def _call_via_openclaw_cli(prompt: str, model: str) -> Optional[str]:
-    """OpenClaw CLI: `openclaw agent -m "prompt" --local`"""
-    cmd = _which("openclaw")
-    if not cmd:
-        return None
-    return _run_cli([cmd, "agent", "-m", prompt, "--local"], prompt)
-
-
-def _call_via_nvidia_nim(prompt: str, system: str) -> str:
-    """NVIDIA NIM OpenAI-compatible API — key loaded from NVIDIA_API_KEY in .env."""
-    import urllib.request, json as _json
-    api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("NVIDIA_API_KEY not set in .env")
-    url = "https://integrate.api.nvidia.com/v1/chat/completions"
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    body = _json.dumps({
-        "model": "qwen/qwen2.5-coder-7b-instruct",
-        "messages": messages,
-        "max_tokens": 4096,
-        "temperature": 0.2,
-    }).encode()
-    req = urllib.request.Request(url, data=body, headers={
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    })
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        result = _json.loads(resp.read())
-    return result["choices"][0]["message"]["content"]
-
-
-def _call_via_anthropic_sdk(
-    prompt: str,
-    system: str,
-    model: str,
-    image_b64: Optional[str] = None,
-) -> str:
-    """Anthropic SDK — supports both text and vision. Requires ANTHROPIC_API_KEY."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set")
-
-    import anthropic
-    client = anthropic.Anthropic(api_key=api_key)
-
-    content: list = []
-    if image_b64:
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
-        })
-    content.append({"type": "text", "text": prompt})
-
-    kwargs: dict = {
-        "model": model,
-        "max_tokens": 4096,
-        "messages": [{"role": "user", "content": content}],
-    }
-    if system:
-        kwargs["system"] = system
-
-    msg = client.messages.create(**kwargs)
-    return msg.content[0].text.strip()
-
-
-def _call_via_gemini(
-    prompt: str,
-    system: str,
-    image_b64: Optional[str] = None,
-) -> str:
-    """Gemini API vision + text. Requires GEMINI_API_KEY."""
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY not set")
-
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-pro")
-
-    parts = []
-    if image_b64:
-        import base64
-        parts.append({"mime_type": "image/png", "data": base64.b64decode(image_b64)})
-    full_prompt = f"{system}\n\n{prompt}" if system else prompt
-    parts.append(full_prompt)
-
-    response = model.generate_content(parts)
-    return response.text.strip()
-
-
-def _call_via_github_copilot(
-    prompt: str,
-    system: str,
-    image_b64: Optional[str] = None,
-) -> str:
-    """
-    GitHub Copilot via its OpenAI-compatible endpoint.
-    Requires GITHUB_TOKEN with an active Copilot subscription.
-    Supports vision via gpt-4o.
-    """
-    token = os.environ.get("GITHUB_TOKEN", "")
-    if not token:
-        raise RuntimeError("GITHUB_TOKEN not set")
-
-    import json
-    import urllib.request
-
-    content: list = []
-    if image_b64:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{image_b64}"},
-        })
-    content.append({"type": "text", "text": prompt})
-
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": content})
-
-    payload = json.dumps({
-        "model": "gpt-4o",
-        "messages": messages,
-        "max_tokens": 1024,
-    }).encode()
-
-    req = urllib.request.Request(
-        "https://api.githubcopilot.com/chat/completions",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Editor-Version": "vscode/1.85.0",
-            "Copilot-Integration-Id": "vscode-chat",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode())
-    return data["choices"][0]["message"]["content"].strip()
-
-
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 # Public API
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 
 def call_agent_browser(
     apply_url: str,
@@ -242,14 +81,14 @@ def call_agent_browser(
     profile: dict,
 ) -> Optional[dict]:
     """
-    Hand off external form filling to the ambient agent (claude CLI or openclaw).
+    Hand off external form filling to the claude CLI agent.
 
-    When the pipeline is running inside Claude Code or openclaw, the agent already
+    When the pipeline is running inside Claude Code, the agent already
     has native browser tools (Playwright, WebFetch, Bash). We just describe the task
-    and let the agent execute it — no extra API key or vision model needed.
+    and let the agent execute it.
 
     Returns a result dict {"success": bool, "method": "agent_browser", "error": str|None}
-    or None if no agent CLI is available (caller should fall back to vision approach).
+    or None if claude CLI is not available.
     """
     import re
 
@@ -316,63 +155,49 @@ After completing (or failing), return ONLY this JSON on the last line:
 or if it failed:
 {{"success": false, "method": "agent_browser", "error": "brief reason"}}"""
 
+    cmd = _which("claude")
+    if not cmd:
+        return None
+
     env = _clean_env()
+    try:
+        log.info("Handing external form to claude CLI agent browser")
+        result = subprocess.run(
+            [cmd, "-p", task],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,   # 5 min — agent needs time to browse + fill
+            env=env,
+        )
+        output = (result.stdout or "").strip()
+        log.debug(f"claude agent output:\n{output[-500:]}")
 
-    # Build CLI-specific command args for browser handoff
-    # Codex: full system access + playwright-cli skill
-    # Claude/OpenClaw: standard non-interactive mode
-    cli_commands: list[tuple[str, list[str]]] = []
-    for cli_name, arg_builder in [
-        ("codex",    lambda cmd: [cmd, "exec", "--dangerously-bypass-approvals-and-sandbox", task]),
-        ("claude",   lambda cmd: [cmd, "-p", task]),
-        ("openclaw", lambda cmd: [cmd, "agent", "-m", task, "--local"]),
-    ]:
-        cmd = _which(cli_name)
-        if cmd:
-            cli_commands.append((cli_name, arg_builder(cmd)))
+        # Extract the last JSON object from the output
+        matches = re.findall(r'\{[^{}]*"success"[^{}]*\}', output)
+        if matches:
+            parsed = json.loads(matches[-1])
+            log.info(f"Agent browser result (claude): {parsed}")
+            return parsed
 
-    # Priority: Codex first, then Claude, then OpenClaw
-    for cli_name, args in cli_commands:
-        try:
-            log.info(f"Handing external form to {cli_name} agent browser")
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=300,   # 5 min — agent needs time to browse + fill
-                env=env,
-            )
-            output = (result.stdout or "").strip()
-            log.debug(f"{cli_name} agent output:\n{output[-500:]}")
+        # No structured JSON — infer from text
+        last_lines = output.lower().split("\n")[-5:]
+        if any("success" in l and ("true" in l or ": true" in l) for l in last_lines):
+            return {"success": True, "method": "agent_browser", "error": None}
+        if result.returncode != 0:
+            log.warning(f"claude agent exited {result.returncode}: {result.stderr[:300]}")
+            return None
 
-            # Extract the last JSON object from the output
-            matches = re.findall(r'\{[^{}]*"success"[^{}]*\}', output)
-            if matches:
-                parsed = json.loads(matches[-1])
-                log.info(f"Agent browser result ({cli_name}): {parsed}")
-                return parsed
+        log.warning("claude completed (exit 0) but returned no structured result")
+        return None
 
-            # No structured JSON — infer from text
-            last_lines = output.lower().split("\n")[-5:]
-            if any("success" in l and ("true" in l or ": true" in l) for l in last_lines):
-                return {"success": True, "method": "agent_browser", "error": None}
-            if result.returncode != 0:
-                log.warning(f"{cli_name} agent exited {result.returncode}: {result.stderr[:300]}")
-                continue  # Try next CLI in priority order
-            # CLI exited 0 but no structured result — try next CLI
-            log.warning(f"{cli_name} completed (exit 0) but returned no structured result — trying next CLI")
-            continue
-
-        except subprocess.TimeoutExpired:
-            log.warning(f"{cli_name} agent timed out (5 min) — trying next CLI")
-            continue  # Try next CLI instead of giving up entirely
-        except Exception as exc:
-            log.debug(f"{cli_name} agent error: {exc}")
-            continue
-
-    return None  # No agent CLI available — caller falls back to vision
+    except subprocess.TimeoutExpired:
+        log.warning("claude agent timed out (5 min)")
+        return None
+    except Exception as exc:
+        log.debug(f"claude agent error: {exc}")
+        return None
 
 
 def call_llm(
@@ -382,67 +207,28 @@ def call_llm(
     image_b64: Optional[str] = None,
 ) -> str:
     """
-    Call the best available LLM and return the response text.
+    Call Claude CLI and return the response text.
 
-    TEXT (no image):
-      claude CLI → openclaw CLI → Anthropic SDK
-
-    VISION (image_b64 provided):
-      Anthropic SDK → Gemini API → GitHub Copilot
+    Vision (image_b64) is not supported in CLI-only mode — raises RuntimeError
+    so callers can fall back to alternative strategies (e.g. blind form fill).
     """
     if image_b64:
-        # Vision chain
-        errors = []
-        for name, fn in [
-            ("Anthropic SDK", lambda: _call_via_anthropic_sdk(prompt, system, model, image_b64)),
-            ("Gemini API",    lambda: _call_via_gemini(prompt, system, image_b64)),
-            ("GitHub Copilot", lambda: _call_via_github_copilot(prompt, system, image_b64)),
-        ]:
-            try:
-                result = fn()
-                log.debug(f"Vision call handled by {name}")
-                return result
-            except Exception as exc:
-                log.debug(f"{name} unavailable: {exc}")
-                errors.append(f"{name}: {exc}")
-
         raise RuntimeError(
-            "No vision-capable LLM is configured.\n"
-            "Set one of the following in your .env file:\n"
-            "  ANTHROPIC_API_KEY=sk-ant-...\n"
-            "  GEMINI_API_KEY=AIza...\n"
-            "  GITHUB_TOKEN=ghp_...  (needs Copilot subscription)\n"
-            f"Attempted providers:\n" + "\n".join(f"  - {e}" for e in errors)
+            "Vision calls not supported in CLI-only mode. "
+            "External form fill will use blind fill instead."
         )
 
-    # Text-only chain: Codex → Claude → OpenClaw → NVIDIA NIM → Anthropic SDK
     full_prompt = f"{system}\n\n{prompt}" if system else prompt
-
-    response = _call_via_codex_cli(full_prompt, model)
-    if response:
-        log.debug("Text call handled by codex CLI")
-        return response
 
     response = _call_via_claude_cli(full_prompt, model)
     if response:
         log.debug("Text call handled by claude CLI")
         return response
 
-    response = _call_via_openclaw_cli(full_prompt, model)
-    if response:
-        log.debug("Text call handled by openclaw CLI")
-        return response
-
-    try:
-        response = _call_via_nvidia_nim(prompt, system)
-        if response:
-            log.debug("Text call handled by NVIDIA NIM")
-            return response
-    except Exception as exc:
-        log.debug(f"NVIDIA NIM unavailable: {exc}")
-
-    log.info("No CLI (codex/claude/openclaw) or NVIDIA NIM available — falling back to Anthropic SDK")
-    return _call_via_anthropic_sdk(prompt, system, model)
+    raise RuntimeError(
+        "claude CLI is not available. Install Claude Code: "
+        "npm install -g @anthropic-ai/claude-code"
+    )
 
 
 call_claude = call_llm  # backward compat alias
