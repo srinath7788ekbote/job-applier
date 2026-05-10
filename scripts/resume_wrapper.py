@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from claude_client import call_llm, strip_json_fences
+from claude_client import call_llm, strip_json_fences, _clean_env
 from resume_parser import read_resume_text
 
 log = logging.getLogger(__name__)
@@ -131,7 +131,7 @@ If a field is not in the resume, set it to null. Never invent content.
     log.info(f"Rendering tailored resume to {output_path}")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-    env = {k: v for k, v in __import__("os").environ.items() if k != "CLAUDECODE"}
+    env = _clean_env()
     result = subprocess.run(
         [
             python, str(skill_dir / "skill.py"),

@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from claude_client import _clean_env
+
 log = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent.parent
@@ -21,9 +23,9 @@ SCRAPER_DIR = BASE_DIR / "vendor" / "job-scraper"
 
 
 def _make_job_id(url: str, company: str, title: str) -> str:
-    """Stable 12-char ID derived from url+company+title."""
+    """Stable 16-char ID derived from url+company+title."""
     raw = f"{url}{company}{title}".lower().strip()
-    return hashlib.md5(raw.encode()).hexdigest()[:12]
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 def _normalize(raw: dict, scraped_at: str) -> dict:
@@ -83,8 +85,7 @@ def run_scraper(
 
         log.info(f"Running scraper: {' '.join(cmd)}")
 
-        # Strip CLAUDECODE so the subprocess isn't blocked by Claude Code's nesting guard
-        env = {k: v for k, v in __import__("os").environ.items() if k != "CLAUDECODE"}
+        env = _clean_env()
         try:
             result = subprocess.run(
                 cmd,

@@ -64,8 +64,8 @@ if claude_found:
         # Must unset CLAUDECODE — Claude Code blocks nested sessions otherwise
         env_no_nested = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
         result = subprocess.run(
-            ["claude", "-p", "Reply with exactly: HELLO", "--model", "claude-haiku-4-5-20251001"],
-            capture_output=True, text=True, timeout=30, env=env_no_nested
+            ["claude", "-p", "Reply with exactly: HELLO", "--model", "claude-sonnet-4-6"],
+            capture_output=True, text=True, timeout=60, env=env_no_nested
         )
         works = result.returncode == 0 and result.stdout.strip()
         check("claude CLI responds to prompts", works,
@@ -136,15 +136,9 @@ if config_path.exists():
         check("config.yaml is valid YAML", False, str(e))
 
 if env_path.exists():
-    from dotenv import dotenv_values
-    env = dotenv_values(str(env_path))
-    api_key = env.get("ANTHROPIC_API_KEY", "")
-    if api_key and not api_key.startswith("your_"):
-        check("ANTHROPIC_API_KEY in .env (optional)", True, "Set — SDK fallback available")
-    else:
-        print(f"  {SKIP}  ANTHROPIC_API_KEY not set (optional — claude CLI is used instead)")
+    check(".env file exists", True)
 else:
-    print(f"  {SKIP}  .env not found (optional — claude CLI is used instead)")
+    check(".env file exists", False, "Copy .env.example to .env and add your LinkedIn credentials")
 
 
 # ─────────────────────────────────────────────────────────

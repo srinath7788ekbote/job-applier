@@ -7,6 +7,7 @@ logs/ran_dates.txt
 
 # Tailored resumes (personal data — generated per run)
 data/tailored/*.pdf
+data/tailored/*.json
 
 # Your resume (personal data — add your own, never commit)
 data/base_resume.pdf
@@ -34,6 +35,7 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.coverage
 
 # Playwright-cli session snapshots and screenshots
 .playwright-cli/

@@ -11,7 +11,7 @@
     - "linkedin"
   max_jobs_per_run: 3                       # max jobs to process per pipeline run
   days_back: 1                              # scrape jobs posted in last N days
-  min_match_score: 60                       # skip jobs below this ATS score (0-100)
+  min_match_score: 50                       # skip jobs below this ATS score (0-100)
   resume_template: "professional"           # professional | modern | classic
 
 paths:

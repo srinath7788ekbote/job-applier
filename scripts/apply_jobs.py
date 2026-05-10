@@ -230,7 +230,7 @@ def apply_linkedin_easy_apply(
 
     if _detect_linkedin_auth_wall(page):
         # Auth wall hit — but the job may still have an external apply URL embedded in the page.
-        # Try to extract it and hand off to the openclaw agent rather than giving up.
+        # Try to extract it and hand off to the claude CLI agent rather than giving up.
         log.info("LinkedIn auth wall detected — attempting to extract external apply URL for agent handoff")
         external_url = _extract_external_apply_url(page)
         if external_url:
@@ -740,7 +740,7 @@ def run_application(
 
                 # Try saved cookies only — never attempt automated login.
                 # If cookies are missing/expired, the auth wall will be detected
-                # in apply_linkedin_easy_apply() and handed off to the openclaw agent.
+                # in apply_linkedin_easy_apply() and handed off to the claude CLI agent.
                 if li_email and li_password:
                     _load_linkedin_cookies(context, page)
                 else:
