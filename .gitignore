@@ -48,3 +48,8 @@ jobs.csv
 # OS
 .DS_Store
 Thumbs.db
+
+# Local agent memory and config (Claude Code, Codex)
+.claude/
+.codex/
+CLAUDE.md
