@@ -32,7 +32,7 @@ def test_default_model_is_sonnet():
 
 def test_call_llm_uses_claude_cli(monkeypatch):
     """Claude CLI should be used for text prompts."""
-    monkeypatch.setattr(claude_client, "_call_via_claude_cli", lambda *a: "CLI response")
+    monkeypatch.setattr(claude_client, "_call_via_claude_cli", lambda *a, **kw: "CLI response")
 
     result = claude_client.call_llm("test prompt")
     assert result == "CLI response"
@@ -40,23 +40,45 @@ def test_call_llm_uses_claude_cli(monkeypatch):
 
 def test_call_llm_raises_when_cli_unavailable(monkeypatch):
     """Should raise RuntimeError when claude CLI is not available."""
-    monkeypatch.setattr(claude_client, "_call_via_claude_cli", lambda *a: None)
+    monkeypatch.setattr(claude_client, "_call_via_claude_cli", lambda *a, **kw: None)
 
     with pytest.raises(RuntimeError, match="claude CLI is not available"):
         claude_client.call_llm("test prompt")
 
 
-def test_call_llm_vision_raises():
-    """Vision calls should raise RuntimeError (not supported in CLI-only mode)."""
-    with pytest.raises(RuntimeError, match="Vision calls not supported"):
-        claude_client.call_llm("describe image", image_b64="abc123")
+def test_call_llm_vision_ignored(monkeypatch):
+    """Vision params should be silently ignored in CLI-only mode."""
+    monkeypatch.setattr(claude_client, "_call_via_claude_cli", lambda *a, **kw: "ok")
+    # Should NOT raise — just ignores the image args
+    result = claude_client.call_llm("describe image", image_b64="abc123")
+    assert result == "ok"
+
+
+def test_call_llm_image_file_ignored(monkeypatch):
+    """image_file should be silently ignored (CLI subprocess can't upload local files)."""
+    monkeypatch.setattr(claude_client, "_call_via_claude_cli", lambda *a, **kw: "ok")
+    result = claude_client.call_llm("describe", image_file="/tmp/screenshot.png")
+    assert result == "ok"
+
+
+def test_call_llm_passes_prompt_to_cli(monkeypatch):
+    """Prompt should be forwarded to the CLI."""
+    captured = {}
+
+    def fake_cli(prompt, model):
+        captured["prompt"] = prompt
+        return "ok"
+
+    monkeypatch.setattr(claude_client, "_call_via_claude_cli", fake_cli)
+    claude_client.call_llm("test prompt")
+    assert "test prompt" in captured["prompt"]
 
 
 def test_call_llm_passes_model(monkeypatch):
     """Model parameter is passed through to claude CLI."""
     captured = {}
 
-    def fake_cli(prompt, model):
+    def fake_cli(prompt, model, files=None):
         captured["model"] = model
         return "ok"
 
@@ -69,7 +91,7 @@ def test_call_llm_prepends_system_prompt(monkeypatch):
     """System prompt should be prepended to the prompt."""
     captured = {}
 
-    def fake_cli(prompt, model):
+    def fake_cli(prompt, model, files=None):
         captured["prompt"] = prompt
         return "ok"
 

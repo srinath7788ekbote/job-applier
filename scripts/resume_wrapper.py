@@ -85,6 +85,8 @@ These fields must be copied EXACTLY from the original resume. Do NOT change, rep
 8. EMPLOYMENT DATES — copy exactly as written
 9. EDUCATION — degree names, field of study, institution names, graduation years
 10. CERTIFICATIONS — copy names and codes exactly as written
+11. EXPERIENCE-COMPANY BINDING — Each bullet point MUST remain under the company where it originally appeared. NEVER move, copy, or reassign a bullet from one employer to another. If a technology (e.g., ArgoCD, Terraform) was used at Company A, it MUST stay under Company A — do NOT move it to Company B even if it seems more relevant there.
+12. NO CROSS-COMPANY MERGING — Treat each company's experience section as an isolated block. You may reorder bullets WITHIN a company, but never transfer content between companies.
 
 === ANTI-AI DETECTION & TONE RULES ===
 To bypass AI detectors and appeal to engineering hiring managers, you must strictly adhere to this writing style:
@@ -101,10 +103,14 @@ What you MAY change to tailor to the JD:
 - Summary paragraph (reframe focus toward JD priorities, utilizing JD terminology, never change factual claims)
 - Key achievements section (reorder based on JD relevance, adjust wording to highlight JD-specific technologies)
 - Skills section (reorder categories, rename category labels to match JD, reorder items)
-- Experience bullet points (reorder to put the most JD-relevant bullets first, adjust context to highlight overlapping technologies — never invent experience)
+- Experience bullet points WITHIN THE SAME COMPANY ONLY (reorder to put the most JD-relevant bullets first, adjust wording to highlight overlapping technologies — never invent experience, never move bullets between companies)
 - layout_order array: define the strategic section order based on JD relevance and candidate strengths (e.g., if the JD emphasizes project experience, move "projects" above "experience"; push "awards" to the bottom for senior candidates)
 
-If a field is not in the resume, set it to null. Never invent content.
+What you MUST NOT do:
+- Move a bullet from one company to another
+- Attribute technology experience to the wrong employer
+- Combine bullets from different companies into one
+- Invent new bullets that don't exist in the original resume
 === END RULES ===
 """
 

@@ -22,6 +22,7 @@ import random
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -47,7 +48,12 @@ from update_excel     import (
     init_tracker, job_exists, add_job, add_jobs_batch, update_status,
     STATUS_PENDING, STATUS_APPLIED, STATUS_FAILED, STATUS_SKIPPED, STATUS_MANUAL,
 )
-from apply_jobs import run_application
+from apply_jobs import (
+    run_application,
+    open_persistent_browser,
+    ensure_linkedin_login,
+    apply_single_job,
+)
 
 
 # ------------------------------------------------------------------
@@ -72,6 +78,7 @@ class Config:
     slow_mo:              int
     min_delay:            float
     max_delay:            float
+    applicant_qa:         dict
 
 
 def load_config(config_path: Path) -> Config:
@@ -109,6 +116,7 @@ def load_config(config_path: Path) -> Config:
         slow_mo=pw.get("slow_mo", 50),
         min_delay=pw.get("min_delay", 1.5),
         max_delay=pw.get("max_delay", 4.0),
+        applicant_qa=raw.get("applicant", {}),
     )
 
 
@@ -142,15 +150,47 @@ def setup_logging(logs_dir: Path) -> None:
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = logs_dir / f"pipeline_{date.today()}.log"
 
-    handlers = [
-        logging.FileHandler(str(log_file), encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ]
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=handlers,
-    )
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    # Suppress noisy third-party loggers
+    for noisy in ("pdfminer", "pdfminer.psparser", "pdfminer.pdfdocument",
+                  "pdfminer.pdfinterp", "pdfminer.pdfpage", "pdfminer.converter"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # File handler — detailed for debugging
+    fh = logging.FileHandler(str(log_file), encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    root.addHandler(fh)
+
+    # Console handler — clean, minimal (only pipeline.* and root messages)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(message)s"))
+    # Only show pipeline logger and root messages on console, suppress noisy sub-modules
+    ch.addFilter(lambda record: record.name in ("pipeline", "root")
+                 or record.name.startswith("pipeline."))
+    root.addHandler(ch)
+
+
+# ------------------------------------------------------------------
+# Console pretty-print helpers
+# ------------------------------------------------------------------
+def _banner(text: str, char: str = "━", width: int = 60) -> str:
+    return f"\n{char * width}\n  {text}\n{char * width}"
+
+
+def _step(num: int | str, text: str) -> str:
+    return f"\n  [{num}] {text}"
+
+
+def _bullet(text: str, indent: int = 6) -> str:
+    return f"{' ' * indent}• {text}"
+
+
+def _result_line(label: str, value: str, color: str = "") -> str:
+    return f"      {label}: {value}"
 
 
 # ------------------------------------------------------------------
@@ -182,37 +222,43 @@ def run_pipeline(dry_run: bool = False, overrides: dict | None = None) -> None:
     setup_logging(config.logs_dir)
     log = logging.getLogger("pipeline")
 
-    log.info(f"{'=' * 60}")
-    log.info(f"Pipeline started {'(DRY RUN) ' if dry_run else ''}| role={config.target_role} | loc={config.target_location}")
-    log.info(f"{'=' * 60}")
+    mode = "DRY RUN" if dry_run else "LIVE"
+    roles = ", ".join(config.target_role)
+    locs = ", ".join(config.target_location)
+    print(_banner(f"Job Applier Pipeline ({mode})"))
+    print(f"      Role: {roles}")
+    print(f"  Location: {locs}")
+    print(f"   Max jobs: {config.max_jobs_per_run}  |  Min score: {config.min_match_score}  |  Days: {config.days_back}")
+    log.debug(f"Pipeline started {mode} | role={config.target_role} | loc={config.target_location}")
 
     # Guard
     if already_ran_today(config.logs_dir):
+        print("\n  Already ran successfully today — exiting.")
         log.info("Already ran successfully today — exiting")
         return
 
     # Validate resume
     if not config.base_resume.exists():
-        log.error(
-            f"Resume not found at {config.base_resume}. "
-            "Drop your resume (docx or pdf) at data/base_resume.docx and retry."
-        )
+        print(f"\n  ERROR: Resume not found at {config.base_resume}")
+        log.error(f"Resume not found at {config.base_resume}.")
         return
 
     # Init tracker
     init_tracker(str(config.excel_tracker))
 
     # Step 1 — Extract profile
-    log.info("Step 1: Extracting applicant profile from resume")
+    print(_step(1, "Extracting profile from resume..."))
     try:
         profile = get_profile(str(config.base_resume))
-        log.info(f"Profile loaded for: {profile.get('full_name', 'Unknown')}")
+        print(_bullet(f"Profile: {profile.get('full_name', 'Unknown')}"))
+        log.debug(f"Profile loaded for: {profile.get('full_name', 'Unknown')}")
     except Exception as exc:
+        print(f"\n  ERROR: Profile extraction failed: {exc}")
         log.error(f"Profile extraction failed: {exc}")
         return
 
     # Step 2 — Scrape jobs (loop over all target roles, dedup by job_id)
-    log.info("Step 2: Scraping jobs")
+    print(_step(2, "Scraping jobs from LinkedIn..."))
     jobs: list[dict] = []
     seen_ids: set[str] = set()
     for role in config.target_role:
@@ -231,18 +277,21 @@ def run_pipeline(dry_run: bool = False, overrides: dict | None = None) -> None:
                 seen_ids.add(jid)
                 jobs.append(j)
         log.info(f"  {role}: {len(role_jobs)} scraped, {len(jobs)} unique total")
-    log.info(f"Scraped {len(jobs)} unique jobs across {len(config.target_role)} role(s)")
+    print(_bullet(f"Found {len(jobs)} jobs across {len(config.target_role)} role(s)"))
 
     if not jobs:
+        print(_bullet("No jobs found — check network or try different search terms."))
         log.warning("No jobs scraped — check scraper logs or network")
         mark_ran_today(config.logs_dir)
         return
 
     # Step 3 — Filter already seen
     new_jobs = [j for j in jobs if not job_exists(str(config.excel_tracker), j["job_id"])]
+    print(_bullet(f"{len(new_jobs)} new (unseen) jobs"))
     log.info(f"{len(new_jobs)} new (unseen) jobs")
 
     if not new_jobs:
+        print("\n  No new jobs to process today. Done.")
         log.info("No new jobs to process today")
         mark_ran_today(config.logs_dir)
         return
@@ -253,6 +302,7 @@ def run_pipeline(dry_run: bool = False, overrides: dict | None = None) -> None:
     # ------------------------------------------------------------------
     # Step 4+5 — Score & tailor all qualifying jobs in parallel
     # ------------------------------------------------------------------
+    print(_step(3, f"Scoring & tailoring (up to {config.max_jobs_per_run} jobs)..."))
     log.info(f"Step 4+5: Scoring and tailoring up to {config.max_jobs_per_run} jobs in parallel")
 
     def score_and_tailor(job: dict) -> dict:
@@ -266,24 +316,49 @@ def run_pipeline(dry_run: bool = False, overrides: dict | None = None) -> None:
         score_result = score_job(job.get("description", ""), resume_text)
         score = score_result.get("score", 0)
         _log.info(f"Score: {score}/100")
+        print(_bullet(f"{title} @ {company} — Score: {score}/100"))
 
         if score < config.min_match_score:
+            print(f"            ↳ Skipped (below {config.min_match_score} threshold)")
             return {**job, "match_score": score, "score_result": score_result,
                     "tailor_result": "", "_skip": True}
 
         # Tailor resume
-        name_slug    = "_".join(profile.get("full_name", "Applicant").split())
-        safe_title   = "_".join(
-            w for w in "".join(
-                c if c.isalnum() or c == " " else " " for c in title
-            ).split()
-        )[:40]
-        safe_company = "_".join(
-            w for w in "".join(
-                c if c.isalnum() or c == " " else " " for c in company
-            ).split()
-        )[:30]
-        output_path = str(config.tailored_resumes_dir / f"{name_slug}_{safe_company}_{safe_title}.pdf")
+        # Filename: FirstnameLastname_Resume.pdf (clean, professional)
+        # Internal tracking uses job_id for dedup, not filename
+        name_parts = profile.get("full_name", "Applicant").split()
+        name_slug = "_".join(name_parts)  # e.g. "Srinath_Ekbote"
+
+        # Short role keyword (max 2 words, ASCII alpha only, no noise)
+        import re as _re
+        _stop = {
+            "senior", "junior", "lead", "principal", "staff",
+            "the", "and", "for", "with", "engineer", "manager",
+            "specialist", "analyst", "consultant", "associate",
+            "i", "ii", "iii", "iv", "level",
+        }
+        role_words = []
+        for raw_w in title.split():
+            w = _re.sub(r"[^A-Za-z]", "", raw_w)  # strip non-alpha
+            if len(w) > 2 and w.lower() not in _stop:
+                role_words.append(w)
+            if len(role_words) == 2:
+                break
+        role_tag = "_".join(role_words) if role_words else "Resume"
+
+        # Final filename: Name_Role.pdf (e.g. Srinath_Ekbote_SRE.pdf)
+        base_filename = f"{name_slug}_{role_tag}.pdf"
+
+        # Handle collisions by appending a short hash of the job_id
+        output_file = config.tailored_resumes_dir / base_filename
+        if output_file.exists():
+            import hashlib
+            job_hash = hashlib.md5(
+                job.get("job_id", company + title).encode()
+            ).hexdigest()[:6]
+            base_filename = f"{name_slug}_{role_tag}_{job_hash}.pdf"
+
+        output_path = str(config.tailored_resumes_dir / base_filename)
 
         try:
             tailor_result = run_resume_skill(
@@ -294,8 +369,10 @@ def run_pipeline(dry_run: bool = False, overrides: dict | None = None) -> None:
                 resume_skill_dir=config.resume_skill_vendor,
             )
             _log.info(f"Tailored resume: {tailor_result}")
+            print(f"            ↳ Resume: {Path(tailor_result).name}")
         except Exception as exc:
             _log.error(f"Resume tailoring failed: {exc} — using base resume")
+            print(f"            ↳ Tailoring failed — using base resume")
             tailor_result = str(config.base_resume)
 
         return {**job, "match_score": score, "score_result": score_result,
@@ -356,109 +433,133 @@ def run_pipeline(dry_run: bool = False, overrides: dict | None = None) -> None:
     add_jobs_batch(str(config.excel_tracker), batch_rows)
 
     # Process applications
-    for job in enriched_jobs:
-        jid          = job["job_id"]
-        title        = job.get("title", "?")
-        company      = job.get("company", "?")
-        score        = job["match_score"]
-        tailor_result= job.get("tailor_result", "")
+    if apply_jobs_list and not dry_run:
+        print(_step(4, "Applying to jobs..."))
+    elif dry_run:
+        print(_step(4, "Dry run — skipping applications"))
 
-        if job.get("_skip"):
-            processed += 1
-            continue
+    # Open ONE persistent browser for all live applications (shared session).
+    # ExitStack ensures cleanup even if login or an application raises.
+    with ExitStack() as _stack:
+        _bctx, _bpage = None, None
+        if apply_jobs_list and not dry_run:
+            _bctx, _bpage = _stack.enter_context(
+                open_persistent_browser(config.headless, config.slow_mo)
+            )
+            # Login to LinkedIn once for the entire batch
+            has_linkedin = any(
+                "linkedin.com" in j.get("apply_url", "")
+                for j in enriched_jobs if not j.get("_skip")
+            )
+            if has_linkedin:
+                logged_in = ensure_linkedin_login(_bpage, _bctx)
+                if logged_in:
+                    print(_bullet("LinkedIn session active"))
+                else:
+                    print(_bullet("LinkedIn login failed — will use agent handoff"))
 
-        if dry_run:
-            log.info(f"DRY RUN: would apply to {job.get('apply_url')}")
-            update_status(str(config.excel_tracker), jid, STATUS_PENDING, "dry_run — not applied")
-            processed += 1
-            continue
+        for job in enriched_jobs:
+            jid          = job["job_id"]
+            title        = job.get("title", "?")
+            company      = job.get("company", "?")
+            score        = job["match_score"]
+            tailor_result= job.get("tailor_result", "")
 
-        # Step 7 — Apply
-        log.info(f"Step 7: Applying to {job.get('apply_url')}")
-        resume_to_upload = tailor_result if tailor_result and Path(tailor_result).exists() else str(config.base_resume)
-
-        apply_result = run_application(
-            job=job,
-            resume_path=resume_to_upload,
-            profile=profile,
-            headless=config.headless,
-            slow_mo=config.slow_mo,
-            min_delay=config.min_delay,
-            max_delay=config.max_delay,
-        )
-
-        reason = apply_result.get("reason", "")
-        method = apply_result.get("method", "")
-        error  = apply_result.get("error") or ""
-
-        # ── Agent handoff: collect all into one list ──────────────────────────
-        # Guard: skip handoff if already applied (pipeline applied it directly)
-        if method == "agent_handoff_required" and job.get("status") == STATUS_APPLIED:
-            log.info(f"Skipping handoff for {title} @ {company} — already applied directly")
-            processed += 1
-            continue
-
-        if method == "agent_handoff_required":
-            # Try claude CLI agent for CAPTCHA/auth wall cases
-            from claude_client import call_agent_browser
-            handoff_url = apply_result.get("url", job.get("apply_url", ""))
-            handoff_resume = apply_result.get("resume_path", resume_to_upload)
-            log.info(f"Trying CLI agents for {title} @ {company} (reason: {error})")
-            agent_result = call_agent_browser(handoff_url, handoff_resume, profile)
-            if agent_result and agent_result.get("success"):
-                update_status(str(config.excel_tracker), jid, STATUS_APPLIED,
-                              f"method=agent_browser ({agent_result.get('method', '')})")
-                log.info(f"Agent applied successfully: {title} @ {company}")
+            if job.get("_skip"):
                 processed += 1
                 continue
 
-            # Agent failed or unavailable — queue for manual handoff
-            handoff_jobs.append({
-                "job_id":      jid,
-                "title":       title,
-                "company":     company,
-                "apply_url":   handoff_url,
-                "resume_path": handoff_resume,
-                "profile":     profile,
-                "tracker":     str(config.excel_tracker),
-            })
-            update_status(str(config.excel_tracker), jid, STATUS_MANUAL,
-                          "agent_handoff_required — queued in agent_handoff.json")
-            log.info(f"Queued for manual handoff: {title} @ {company}")
+            if dry_run:
+                print(_bullet(f"{title} @ {company} — ready to apply"))
+                log.info(f"DRY RUN: would apply to {job.get('apply_url')}")
+                update_status(str(config.excel_tracker), jid, STATUS_PENDING, "dry_run — not applied")
+                processed += 1
+                continue
+
+            # Step 7 — Apply
+            print(_bullet(f"{title} @ {company}..."))
+            log.info(f"Step 7: Applying to {job.get('apply_url')}")
+            resume_to_upload = tailor_result if tailor_result and Path(tailor_result).exists() else str(config.base_resume)
+
+            apply_result = apply_single_job(
+                _bpage, _bctx, job,
+                resume_path=resume_to_upload,
+                profile=profile,
+                min_delay=config.min_delay,
+                max_delay=config.max_delay,
+                resume_text=resume_text,
+                applicant_qa=config.applicant_qa,
+            )
+
+            reason = apply_result.get("reason", "")
+            method = apply_result.get("method", "")
+            error  = apply_result.get("error") or ""
+
+            # ── Agent handoff: queue for manual review ────────────────────────
+            # CAPTCHA / auth wall / no-form cases can't be automated further —
+            # queue them in agent_handoff.json for the user to handle manually.
+            if method == "agent_handoff_required" and job.get("status") == STATUS_APPLIED:
+                log.info(f"Skipping handoff for {title} @ {company} — already applied directly")
+                processed += 1
+                continue
+
+            if method == "agent_handoff_required":
+                handoff_url = apply_result.get("url", job.get("apply_url", ""))
+                handoff_resume = apply_result.get("resume_path", resume_to_upload)
+                handoff_jobs.append({
+                    "job_id":      jid,
+                    "title":       title,
+                    "company":     company,
+                    "apply_url":   handoff_url,
+                    "resume_path": handoff_resume,
+                    "profile":     profile,
+                    "tracker":     str(config.excel_tracker),
+                })
+                update_status(str(config.excel_tracker), jid, STATUS_MANUAL,
+                              f"manual review — {error}")
+                print(f"            ↳ Manual review needed: {error}")
+                log.info(f"Queued for manual handoff: {title} @ {company}")
+                processed += 1
+                continue
+
+            if apply_result["success"]:
+                status = STATUS_APPLIED
+                notes  = f"method={apply_result.get('method', '')}"
+            elif reason in ("captcha_detected",) or "captcha" in error.lower():
+                status = STATUS_MANUAL
+                notes  = "CAPTCHA detected — please apply manually via apply_url"
+            elif reason == "2fa_required":
+                status = STATUS_MANUAL
+                notes  = "LinkedIn 2FA triggered — disable 2FA on your account or apply manually"
+            elif reason == "linkedin_auth_required":
+                status = STATUS_MANUAL
+                notes  = "LinkedIn requires browser login — add LINKEDIN_EMAIL/PASSWORD to .env"
+            elif "vision unavailable" in error.lower() or "manual_required" in error.lower():
+                status = STATUS_MANUAL
+                notes  = "No Easy Apply + vision form fill unavailable — apply manually via apply_url"
+            elif reason == "no_easy_apply":
+                status = STATUS_FAILED
+                notes  = "No Easy Apply button and external form also failed"
+            else:
+                status = STATUS_FAILED
+                notes  = error or reason or "Unknown failure"
+
+            update_status(str(config.excel_tracker), jid, status, notes)
+            if status == STATUS_APPLIED:
+                print(f"            ↳ ✓ Applied ({method})")
+            elif status == STATUS_MANUAL:
+                print(f"            ↳ Manual review needed: {reason}")
+            else:
+                print(f"            ↳ ✗ Failed: {reason or error}")
+            log.info(f"Result: {status} | {notes}")
             processed += 1
-            continue
 
-        if apply_result["success"]:
-            status = STATUS_APPLIED
-            notes  = f"method={apply_result.get('method', '')}"
-        elif reason in ("captcha_detected",) or "captcha" in error.lower():
-            status = STATUS_MANUAL
-            notes  = "CAPTCHA detected — please apply manually via apply_url"
-        elif reason == "2fa_required":
-            status = STATUS_MANUAL
-            notes  = "LinkedIn 2FA triggered — disable 2FA on your account or apply manually"
-        elif reason == "linkedin_auth_required":
-            status = STATUS_MANUAL
-            notes  = "LinkedIn requires browser login — add LINKEDIN_EMAIL/PASSWORD to .env"
-        elif "vision unavailable" in error.lower() or "manual_required" in error.lower():
-            status = STATUS_MANUAL
-            notes  = "No Easy Apply + vision form fill unavailable — apply manually via apply_url"
-        elif reason == "no_easy_apply":
-            status = STATUS_FAILED
-            notes  = "No Easy Apply button and external form also failed"
-        else:
-            status = STATUS_FAILED
-            notes  = error or reason or "Unknown failure"
-
-        update_status(str(config.excel_tracker), jid, status, notes)
-        log.info(f"Result: {status} | {notes}")
-        processed += 1
-
-        # Polite delay between direct applications (1 minute)
-        if processed < len(enriched_jobs) and not dry_run:
-            delay = random.uniform(55, 65)
-            log.info(f"Waiting {delay:.0f}s before next application")
-            time.sleep(delay)
+            # Polite delay between direct applications (1 minute)
+            if processed < len(enriched_jobs) and not dry_run:
+                delay = random.uniform(55, 65)
+                log.info(f"Waiting {delay:.0f}s before next application")
+                print(f"\n      Waiting {delay:.0f}s before next application...")
+                time.sleep(delay)
 
     # ------------------------------------------------------------------
     # Write single agent_handoff.json array (all queued jobs)
@@ -469,9 +570,23 @@ def run_pipeline(dry_run: bool = False, overrides: dict | None = None) -> None:
         handoff_path.write_text(json.dumps(handoff_jobs, indent=2), encoding="utf-8")
         log.info(f"agent_handoff.json written with {len(handoff_jobs)} job(s): {[j['title'] for j in handoff_jobs]}")
 
-    log.info(f"{'=' * 60}")
+    # ── Summary ──────────────────────────────────────────────────────
+    applied  = sum(1 for j in enriched_jobs if not j.get("_skip") and j.get("tailor_result"))
+    skipped  = sum(1 for j in enriched_jobs if j.get("_skip"))
+    manual   = len(handoff_jobs)
+
+    print(_banner("Summary"))
+    print(f"   Processed: {processed}")
+    print(f"     Applied: {applied - manual}")
+    print(f"      Manual: {manual}")
+    print(f"     Skipped: {skipped}")
+    if handoff_jobs:
+        print(f"\n   Manual review needed ({len(handoff_jobs)}):")
+        for hj in handoff_jobs:
+            print(f"      • {hj['title']} @ {hj['company']}")
+    print()
+
     log.info(f"Pipeline complete — {processed} jobs processed")
-    log.info(f"{'=' * 60}")
     mark_ran_today(config.logs_dir)
 
 

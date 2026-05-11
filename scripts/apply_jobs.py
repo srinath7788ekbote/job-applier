@@ -4,33 +4,34 @@ Browser automation for job applications using Playwright (sync API).
 
 Supports:
   - LinkedIn Easy Apply (multi-step modal)
-  - External application forms (Claude Vision-guided)
+  - External application forms (DOM agent-guided)
 
 CAPTCHA detection: if detected in headless mode, marks job as manual_required
 so the user can apply manually later.
 """
 
-import base64
 import json
 import logging
 import os
 import random
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
 from claude_client import call_llm, strip_json_fences
+from dom_agent import dom_agent_fill, extract_dom_state, extract_validation_errors
 from playwright.sync_api import sync_playwright, Page, BrowserContext, Locator
 
 log = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent.parent
-LINKEDIN_SESSION_FILE = BASE_DIR / "data" / "linkedin_session.json"
+CHROME_PROFILE_DIR = BASE_DIR / "data" / "chrome_profile"
 
 STEALTH_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+    "Chrome/136.0.0.0 Safari/537.36"
 )
 
 STEALTH_SCRIPT = """
@@ -55,8 +56,8 @@ CAPTCHA_PATTERNS = [
 LINKEDIN_AUTH_WALL_SELECTORS = [
     ".modal__overlay--visible",           # sign-in overlay blocking the page
     '[data-tracking-control-name="csm-v2_sign-in-session-key"]',  # sign-in field
-    'form[action*="login"]',
-    'a[href*="linkedin.com/login"]',
+    '.authwall-join-form',                 # full-page authwall form
+    'form.login__form',                    # login form on /login page
 ]
 
 
@@ -90,17 +91,21 @@ def find_by_label(page: Page, label_text: str) -> Optional[Locator]:
     Returns a Locator or None.
     """
     text_lower = label_text.lower()
+    # Escape quotes to prevent XPath/CSS injection (e.g. names like O'Brien)
+    xpath_safe = text_lower.replace("'", "\\'")
+    css_safe = label_text.replace('"', '\\"')
+    css_safe_lower = text_lower.replace('"', '\\"')
     strategies = [
         # By associated label element text
-        f'//label[contains(translate(text(),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"{text_lower}")]',
+        f'//label[contains(translate(text(),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"{xpath_safe}")]',
         # By placeholder
-        f'input[placeholder*="{label_text}" i], textarea[placeholder*="{label_text}" i]',
+        f'input[placeholder*="{css_safe}" i], textarea[placeholder*="{css_safe}" i]',
         # By aria-label
-        f'input[aria-label*="{label_text}" i], textarea[aria-label*="{label_text}" i], select[aria-label*="{label_text}" i]',
+        f'input[aria-label*="{css_safe}" i], textarea[aria-label*="{css_safe}" i], select[aria-label*="{css_safe}" i]',
         # By name attribute
-        f'input[name*="{text_lower}"], select[name*="{text_lower}"], textarea[name*="{text_lower}"]',
+        f'input[name*="{css_safe_lower}"], select[name*="{css_safe_lower}"], textarea[name*="{css_safe_lower}"]',
         # By id
-        f'input[id*="{text_lower}"], select[id*="{text_lower}"], textarea[id*="{text_lower}"]',
+        f'input[id*="{css_safe_lower}"], select[id*="{css_safe_lower}"], textarea[id*="{css_safe_lower}"]',
     ]
 
     for strategy in strategies:
@@ -124,16 +129,41 @@ def find_by_label(page: Page, label_text: str) -> Optional[Locator]:
 
 
 def _detect_captcha(page: Page) -> bool:
-    """Return True if the page contains CAPTCHA indicators."""
+    """Return True if the page contains CAPTCHA indicators (text or iframes)."""
     try:
         text = page.inner_text("body").lower()
-        return any(pattern in text for pattern in CAPTCHA_PATTERNS)
+        if any(pattern in text for pattern in CAPTCHA_PATTERNS):
+            return True
     except Exception:
-        return False
+        pass
+    # Check for reCAPTCHA / hCaptcha iframes
+    try:
+        captcha_iframes = page.locator(
+            'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], '
+            'iframe[title*="reCAPTCHA"], iframe[title*="hCaptcha"], '
+            'iframe[src*="captcha"], iframe[src*="challenge"]'
+        )
+        if captcha_iframes.count() > 0:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _detect_linkedin_auth_wall(page: Page) -> bool:
     """Return True if LinkedIn is showing a sign-in wall blocking the apply flow."""
+    # If user avatar is visible in the nav, we are logged in — not an auth wall
+    try:
+        if page.locator(".global-nav__me, [data-test-global-nav-me]").count() > 0:
+            return False
+    except Exception:
+        pass
+
+    # Check URL — login/authwall pages are definitive
+    current_url = page.url.lower()
+    if any(kw in current_url for kw in ["/login", "/authwall", "/uas/login"]):
+        return True
+
     for selector in LINKEDIN_AUTH_WALL_SELECTORS:
         try:
             if page.locator(selector).count() > 0:
@@ -215,6 +245,8 @@ def apply_linkedin_easy_apply(
     profile: dict,
     min_delay: float = 1.5,
     max_delay: float = 4.0,
+    resume_text: str = "",
+    applicant_qa: dict | None = None,
 ) -> dict:
     """
     Attempt LinkedIn Easy Apply.
@@ -235,10 +267,10 @@ def apply_linkedin_easy_apply(
         external_url = _extract_external_apply_url(page)
         if external_url:
             log.info(f"External URL found despite auth wall: {external_url} — handing off to agent")
-            return apply_external_form(page, external_url, resume_path, profile, min_delay, max_delay)
+            return apply_external_form(page, external_url, resume_path, profile, min_delay, max_delay, resume_text, applicant_qa)
         # No external URL extractable — fall back to the job URL itself for agent handoff
         log.info("No external URL found — handing off job URL directly to agent")
-        return apply_external_form(page, job_url, resume_path, profile, min_delay, max_delay)
+        return apply_external_form(page, job_url, resume_path, profile, min_delay, max_delay, resume_text, applicant_qa)
 
     # Find Easy Apply button
     easy_apply_btn = None
@@ -275,8 +307,34 @@ def apply_linkedin_easy_apply(
             except Exception as exc:
                 log.warning(f"File upload failed: {exc}")
 
-        # Fill visible form fields
+        # Fill visible form fields (static profile mapping first)
         _fill_form_from_profile(page, profile)
+
+        # DOM agent fallback: handle unfilled required fields that profile mapping missed
+        errors = extract_validation_errors(page)
+        modal_elements = extract_dom_state(page)
+        unfilled_required = [
+            el for el in modal_elements
+            if el.get("required") and not el.get("value")
+            and el.get("tag") in ("input", "select", "textarea")
+            and el.get("type") != "file"
+        ]
+        if unfilled_required or errors:
+            log.info(f"Easy Apply step {step + 1}: {len(unfilled_required)} unfilled required fields, {len(errors)} errors — asking Claude")
+            try:
+                from dom_agent import build_form_prompt, execute_action
+                prompt = build_form_prompt(
+                    modal_elements, profile, resume_path,
+                    page.url, f"Easy Apply Step {step + 1}", errors, step, 10,
+                    resume_text=resume_text, applicant_qa=applicant_qa,
+                )
+                raw = call_llm(prompt, system="You are filling a job application form on behalf of the applicant.")
+                actions = json.loads(strip_json_fences(raw))
+                for action in actions:
+                    if isinstance(action, dict) and action.get("action") not in ("done", "click"):
+                        execute_action(page, modal_elements, action, resume_path)
+            except Exception as exc:
+                log.warning(f"DOM agent fallback in Easy Apply failed: {exc}")
 
         # Detect submission vs next-step buttons
         submit_btn = None
@@ -325,9 +383,17 @@ def apply_linkedin_easy_apply(
                 return {"success": True, "method": "easy_apply", "reason": None, "error": None}
 
         elif next_btn:
+            # Check for validation errors before clicking Next
+            pre_click_errors = extract_validation_errors(page)
             log.info(f"Easy Apply step {step + 1} — clicking Next/Continue")
             human_click(page, next_btn)
             human_delay(min_delay, max_delay)
+
+            # After clicking Next, check if we're stuck on same page due to errors
+            post_click_errors = extract_validation_errors(page)
+            if post_click_errors and post_click_errors == pre_click_errors:
+                log.warning(f"Easy Apply step {step + 1}: stuck on validation errors: {post_click_errors}")
+                # Page didn't advance — errors still there, will be handled next loop iteration
         else:
             log.warning(f"Easy Apply step {step + 1} — no Next or Submit button found")
             break
@@ -394,15 +460,16 @@ def apply_external_form(
     profile: dict,
     min_delay: float = 1.5,
     max_delay: float = 4.0,
+    resume_text: str = "",
+    applicant_qa: dict | None = None,
 ) -> dict:
     """
-    Fill an external job application form using headless Playwright.
+    Fill an external job application form using DOM-aware agent.
 
     Strategy:
       1. Navigate to the form URL
-      2. Try vision-guided fill (screenshot + LLM) if an API key is configured
-      3. Fall back to blind fill (profile field matching) if vision unavailable
-      4. Signal agent_handoff_required only for CAPTCHA / auth walls
+      2. Use DOM agent (extract elements + screenshot → Claude CLI → execute)
+      3. Signal agent_handoff_required only for CAPTCHA / auth walls
 
     Returns dict: {"success": bool, "method": str, "error": str|None}
     """
@@ -425,14 +492,9 @@ def apply_external_form(
     page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
     human_delay(0.5, 1.0)
 
-    # ── Try vision-guided fill (screenshot + LLM) ────────────────────────────
-    vision_result = _try_vision_fill(page, apply_url, resume_path, profile)
-    if vision_result is not None:
-        return vision_result
-
-    # ── Fallback: blind fill from profile fields ─────────────────────────────
-    log.info("Vision unavailable — using blind form fill from profile")
-    return _blind_fill(page, resume_path, profile)
+    # ── DOM Agent fill (DOM state + screenshot → Claude CLI → execute actions)
+    return dom_agent_fill(page, apply_url, resume_path, profile,
+                          resume_text=resume_text, applicant_qa=applicant_qa)
 
 
 def _signal_handoff(apply_url: str, resume_path: str, reason: str) -> dict:
@@ -447,184 +509,84 @@ def _signal_handoff(apply_url: str, resume_path: str, reason: str) -> dict:
     }
 
 
-def _try_vision_fill(
-    page: Page,
-    apply_url: str,
-    resume_path: str,
-    profile: dict,
-) -> Optional[dict]:
-    """Screenshot the form, send to vision LLM, execute returned actions.
+# ---------------------------------------------------------------------------
+# Persistent browser session
+# ---------------------------------------------------------------------------
 
-    Returns a result dict on success/failure, or None if no vision LLM is available.
+@contextmanager
+def open_persistent_browser(
+    headless: bool = True,
+    slow_mo: int = 50,
+):
+    """Open a persistent Chromium profile that remembers sessions across runs.
+
+    Uses a user-data-dir (like EasyApplyBot's chrome_bot/) so cookies,
+    localStorage, and sessions survive across pipeline runs.  After the
+    first manual login the browser is already authenticated.
+
+    Yields (context, page).
     """
-    profile_json = json.dumps({
-        k: v for k, v in profile.items()
-        if k in ("full_name", "email", "phone", "linkedin_url", "github_url",
-                  "location", "work_authorization", "years_of_experience", "current_title")
-    }, indent=2)
-
-    screenshot_bytes = page.screenshot(full_page=True)
-    screenshot_b64 = base64.standard_b64encode(screenshot_bytes).decode()
-
-    prompt = (
-        "Here is a screenshot of a job application form. "
-        "Based on the applicant profile below, return ONLY a JSON array of actions "
-        "to fill this form. No explanation, no markdown fences.\n\n"
-        'Each action: {"action": "fill"|"select"|"upload"|"click", '
-        '"label": "<field label or button text>", "value": "<value>"}\n\n'
-        f"For file upload fields use action=upload and value={resume_path!r}\n"
-        "For the submit button use action=click and label=the button text.\n\n"
-        f"Applicant profile:\n{profile_json}\n\n"
-        "Return only the JSON array."
-    )
-    try:
-        raw = call_llm(
-            prompt,
-            system="You are helping fill out a job application form.",
-            image_b64=screenshot_b64,
+    CHROME_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as pw:
+        context = pw.chromium.launch_persistent_context(
+            user_data_dir=str(CHROME_PROFILE_DIR),
+            headless=headless,
+            slow_mo=slow_mo,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+            user_agent=STEALTH_USER_AGENT,
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
         )
-        actions = json.loads(strip_json_fences(raw))
-        log.info(f"Vision LLM returned {len(actions)} form actions")
-    except Exception as exc:
-        log.warning(f"Vision-based form analysis unavailable ({exc})")
-        return None  # Caller falls back to blind fill
-
-    for action in actions:
-        act   = action.get("action", "")
-        label = action.get("label", "")
-        value = action.get("value", "")
+        context.add_init_script(STEALTH_SCRIPT)
+        page = context.pages[0] if context.pages else context.new_page()
         try:
-            if act == "fill":
-                loc = find_by_label(page, label)
-                if loc:
-                    loc.fill(str(value))
-                    human_delay(0.3, 0.8)
-            elif act == "select":
-                loc = find_by_label(page, label)
-                if loc:
-                    loc.select_option(label=str(value))
-                    human_delay(0.3, 0.8)
-            elif act == "upload":
-                loc = find_by_label(page, label) or page.locator('input[type="file"]').first
-                if loc:
-                    loc.set_input_files(value)
-                    human_delay(1.0, 2.0)
-            elif act == "click":
-                btn = page.locator(f'button:has-text("{label}"), input[value="{label}"]')
-                if btn.count() > 0:
-                    human_click(page, btn.first)
-                    human_delay(1.5, 3.0)
-        except Exception as exc:
-            log.warning(f"Action failed [{act} '{label}']: {exc}")
-
-    human_delay(2.0, 4.0)
-    return _check_submission(page, "external_form")
+            yield context, page
+        finally:
+            context.close()
 
 
-def _blind_fill(page: Page, resume_path: str, profile: dict) -> dict:
-    """Fill form fields by matching profile keys to common labels, then submit."""
-    _fill_form_from_profile(page, profile)
+def ensure_linkedin_login(page: Page, context: BrowserContext) -> bool:
+    """Check persistent profile for a valid LinkedIn session; login if needed.
 
-    # Upload resume if file input exists
-    try:
-        file_input = page.locator('input[type="file"]').first
-        if file_input.count() > 0:
-            file_input.set_input_files(resume_path)
-            human_delay(1.0, 2.0)
-    except Exception:
-        pass
-
-    # Click submit
-    for submit_label in ["Submit", "Apply Now", "Apply", "Submit Application", "Send Application"]:
-        btn = page.locator(f'button:has-text("{submit_label}"), input[value="{submit_label}"]')
-        if btn.count() > 0 and btn.first.is_visible():
-            human_click(page, btn.first)
-            human_delay(2.0, 3.0)
-            break
-
-    human_delay(2.0, 4.0)
-    return _check_submission(page, "external_form_blind")
-
-
-def _check_submission(page: Page, method: str) -> dict:
-    """Check page for CAPTCHA or success confirmation after submit."""
-    if _detect_captcha(page):
-        return {"success": False, "method": method,
-                "error": "CAPTCHA appeared after submit — apply manually"}
-
-    page_text = ""
-    try:
-        page_text = page.inner_text("body").lower()
-    except Exception:
-        pass
-
-    success_keywords = [
-        "application submitted", "thank you for applying", "successfully applied",
-        "application received", "we'll be in touch", "application complete",
-        "thank you for your interest", "application has been received",
-        "we have received your application", "your application has been submitted",
-        "thanks for applying", "successfully submitted",
-    ]
-    # Also check URL for common confirmation patterns
-    current_url = page.url.lower()
-    url_success = any(kw in current_url for kw in [
-        "thank", "success", "confirm", "submitted", "complete",
-    ])
-    success = any(kw in page_text for kw in success_keywords) or url_success
-    return {
-        "success": success,
-        "method": method,
-        "error": None if success else "No confirmation text detected after submit",
-    }
-
-
-# ---------------------------------------------------------------------------
-# LinkedIn session management
-# ---------------------------------------------------------------------------
-
-def _save_linkedin_cookies(context: BrowserContext) -> None:
-    """Persist browser cookies to disk for reuse across runs."""
-    cookies = context.cookies()
-    LINKEDIN_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-    LINKEDIN_SESSION_FILE.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
-    log.info(f"LinkedIn session saved ({len(cookies)} cookies → {LINKEDIN_SESSION_FILE.name})")
-
-
-def _load_linkedin_cookies(context: BrowserContext, page: Page) -> bool:
+    Returns True if logged in, False otherwise.
     """
-    Load saved cookies into the browser context and verify the session is still valid.
-    Returns True if logged in, False if cookies are missing or expired.
-    """
-    if not LINKEDIN_SESSION_FILE.exists():
-        log.info("No saved LinkedIn session found")
+    li_email = os.environ.get("LINKEDIN_EMAIL", "").strip()
+    li_password = os.environ.get("LINKEDIN_PASSWORD", "").strip()
+
+    if not li_email or not li_password:
+        log.info(
+            "LINKEDIN_EMAIL/PASSWORD not set in .env — "
+            "proceeding without login (auth wall will trigger agent handoff)"
+        )
         return False
 
+    # Persistent profile may already have a valid session
     try:
-        cookies = json.loads(LINKEDIN_SESSION_FILE.read_text(encoding="utf-8"))
-        context.add_cookies(cookies)
-        log.info(f"Loaded {len(cookies)} LinkedIn cookies — verifying session")
-
-        page.goto("https://www.linkedin.com/feed", wait_until="domcontentloaded", timeout=30000)
+        page.goto(
+            "https://www.linkedin.com/feed",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
         human_delay(2.0, 3.0)
 
-        # Logged-in indicator: global nav bar is present
         if page.locator(".global-nav__me, [data-test-global-nav-me]").count() > 0:
-            log.info("LinkedIn session is valid — skipping login")
+            log.info("Already logged in via persistent browser profile")
             return True
 
-        # Feed URL without redirect means we're in — check URL as backup
         if "/feed" in page.url and "login" not in page.url:
-            log.info("LinkedIn session valid (feed URL confirmed)")
+            log.info("Already logged in (feed URL confirmed)")
             return True
-
-        log.info("LinkedIn session expired — will re-login")
-        LINKEDIN_SESSION_FILE.unlink(missing_ok=True)
-        return False
-
     except Exception as exc:
-        log.warning(f"Cookie load failed: {exc} — will re-login")
-        LINKEDIN_SESSION_FILE.unlink(missing_ok=True)
-        return False
+        log.warning(f"Feed check failed: {exc}")
+
+    # No valid session — login with credentials
+    log.info("No valid session in browser profile — logging in")
+    result = login_to_linkedin(page, context, li_email, li_password)
+    return result.get("success", False)
 
 
 def login_to_linkedin(
@@ -634,7 +596,7 @@ def login_to_linkedin(
     password: str,
 ) -> dict:
     """
-    Log in to LinkedIn with email + password and save cookies on success.
+    Log in to LinkedIn with email + password.
     Returns {"success": True} or {"success": False, "reason": str, "error": str}.
     """
     log.info("Logging in to LinkedIn")
@@ -682,13 +644,11 @@ def login_to_linkedin(
 
         # Success — feed or home page
         if "feed" in current_url or "mynetwork" in current_url or page.locator(".global-nav__me").count() > 0:
-            _save_linkedin_cookies(context)
             log.info("LinkedIn login successful")
             return {"success": True}
 
         # Unknown state — assume logged in (some accounts land on different pages)
         log.info(f"LinkedIn login — unknown redirect to {current_url}, assuming success")
-        _save_linkedin_cookies(context)
         return {"success": True}
 
     except Exception as exc:
@@ -696,7 +656,51 @@ def login_to_linkedin(
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# Apply to a single job (reuses an existing browser session)
+# ---------------------------------------------------------------------------
+
+def apply_single_job(
+    page: Page,
+    context: BrowserContext,
+    job: dict,
+    resume_path: str,
+    profile: dict,
+    min_delay: float = 1.5,
+    max_delay: float = 4.0,
+    resume_text: str = "",
+    applicant_qa: dict | None = None,
+) -> dict:
+    """Apply to one job using an already-open browser session."""
+    apply_url = job.get("apply_url") or ""
+
+    try:
+        if "linkedin.com" in apply_url:
+            result = apply_linkedin_easy_apply(
+                page, apply_url, resume_path, profile, min_delay, max_delay,
+                resume_text=resume_text, applicant_qa=applicant_qa,
+            )
+            if result.get("reason") == "no_easy_apply":
+                log.info("No Easy Apply — extracting external apply URL")
+                external_url = _extract_external_apply_url(page) or apply_url
+                log.info(f"External apply URL: {external_url}")
+                result = apply_external_form(
+                    page, external_url, resume_path, profile, min_delay, max_delay,
+                    resume_text=resume_text, applicant_qa=applicant_qa,
+                )
+        else:
+            result = apply_external_form(
+                page, apply_url, resume_path, profile, min_delay, max_delay,
+                resume_text=resume_text, applicant_qa=applicant_qa,
+            )
+    except Exception as exc:
+        log.error(f"apply_single_job unhandled exception: {exc}")
+        result = {"success": False, "method": "unknown", "error": str(exc)}
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Standalone entry point (opens its own browser, applies to one job)
 # ---------------------------------------------------------------------------
 
 def run_application(
@@ -707,71 +711,18 @@ def run_application(
     slow_mo: int = 50,
     min_delay: float = 1.5,
     max_delay: float = 4.0,
+    resume_text: str = "",
+    applicant_qa: dict | None = None,
 ) -> dict:
     """
-    Launch browser, determine apply strategy (Easy Apply vs external),
-    attempt application. Returns result dict with success/method/error.
+    Open a persistent browser, log in if needed, apply to one job, close.
+    For batch use, prefer open_persistent_browser() + apply_single_job().
     """
-    apply_url = job.get("apply_url") or ""
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=headless,
-            slow_mo=slow_mo,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
+    with open_persistent_browser(headless=headless, slow_mo=slow_mo) as (context, page):
+        apply_url = job.get("apply_url") or ""
+        if "linkedin.com" in apply_url:
+            ensure_linkedin_login(page, context)
+        return apply_single_job(
+            page, context, job, resume_path, profile, min_delay, max_delay,
+            resume_text=resume_text, applicant_qa=applicant_qa,
         )
-        context = browser.new_context(
-            user_agent=STEALTH_USER_AGENT,
-            viewport={"width": 1280, "height": 800},
-            locale="en-US",
-        )
-        page = context.new_page()
-        page.add_init_script(STEALTH_SCRIPT)
-
-        try:
-            if "linkedin.com" in apply_url:
-                # ── LinkedIn session management ──────────────────────────────
-                li_email    = os.environ.get("LINKEDIN_EMAIL", "").strip()
-                li_password = os.environ.get("LINKEDIN_PASSWORD", "").strip()
-
-                # Try saved cookies only — never attempt automated login.
-                # If cookies are missing/expired, the auth wall will be detected
-                # in apply_linkedin_easy_apply() and handed off to the claude CLI agent.
-                if li_email and li_password:
-                    _load_linkedin_cookies(context, page)
-                else:
-                    log.info(
-                        "LINKEDIN_EMAIL/PASSWORD not set in .env — "
-                        "proceeding without login (auth wall will trigger agent handoff)"
-                    )
-                # ── Apply ────────────────────────────────────────────────────
-                result = apply_linkedin_easy_apply(
-                    page, apply_url, resume_path, profile, min_delay, max_delay
-                )
-                # If no Easy Apply button, extract the real external URL then apply
-                if result.get("reason") == "no_easy_apply":
-                    log.info("No Easy Apply — extracting external apply URL")
-                    external_url = _extract_external_apply_url(page) or apply_url
-                    log.info(f"External apply URL: {external_url}")
-                    result = apply_external_form(
-                        page, external_url, resume_path, profile, min_delay, max_delay
-                    )
-            else:
-                result = apply_external_form(
-                    page, apply_url, resume_path, profile, min_delay, max_delay
-                )
-        except Exception as exc:
-            log.error(f"run_application unhandled exception: {exc}")
-            result = {"success": False, "method": "unknown", "error": str(exc)}
-        finally:
-            try:
-                context.close()
-                browser.close()
-            except Exception:
-                pass
-
-    return result

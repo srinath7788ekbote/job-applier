@@ -48,26 +48,44 @@ def _run_cli(args: list[str], prompt: str, stdin_input: str | None = None) -> Op
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=180,
+            timeout=300,
             env=env,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+        if result.returncode == 0 and not result.stdout.strip():
+            # CLI exited cleanly but produced no output — check stderr
+            stderr_msg = (result.stderr or "").strip()[:300]
+            log.warning(f"{args[0]} returned empty output (exit 0). stderr: {stderr_msg}")
+        if result.returncode != 0:
+            stdout_msg = (result.stdout or "").strip()[:200]
+            stderr_msg = (result.stderr or "").strip()[:200]
+            combined = stdout_msg or stderr_msg
+            if "limit" in combined.lower() or "reset" in combined.lower():
+                raise RuntimeError(f"Claude CLI rate limited: {combined}")
+            log.warning(f"{args[0]} exited {result.returncode}: stdout={stdout_msg} stderr={stderr_msg}")
+    except FileNotFoundError:
+        log.warning(f"CLI not found: {args[0]}")
+    except subprocess.TimeoutExpired:
+        log.warning(f"CLI timed out after 300s: {args[0]}")
+    except RuntimeError:
+        raise
     except Exception as exc:
         log.debug(f"{args[0]} CLI error: {exc}")
     return None
 
 
-def _call_via_claude_cli(prompt: str, model: str) -> Optional[str]:
-    """Claude CLI: `claude -p "prompt" --model <model>`"""
+def _call_via_claude_cli(prompt: str, model: str, files: list[str] | None = None) -> Optional[str]:
+    """Claude CLI: `claude -p "prompt" --model <model> [--file f1 --file f2 ...]`"""
     cmd = _which("claude")
     if not cmd:
         return None
+    file_args = []
+    for f in (files or []):
+        file_args.extend(["--file", f])
     return (
-        _run_cli([cmd, "-p", prompt, "--model", model], prompt)
-        or _run_cli([cmd, "--print", "--model", model], prompt, stdin_input=prompt)
+        _run_cli([cmd, "-p", prompt, "--model", model] + file_args, prompt)
+        or _run_cli([cmd, "--print", "--model", model] + file_args, prompt, stdin_input=prompt)
     )
 
 
@@ -75,148 +93,21 @@ def _call_via_claude_cli(prompt: str, model: str) -> Optional[str]:
 # Public API
 # ─────────────────────────────────────────────────────────
 
-def call_agent_browser(
-    apply_url: str,
-    resume_path: str,
-    profile: dict,
-) -> Optional[dict]:
-    """
-    Hand off external form filling to the claude CLI agent.
-
-    When the pipeline is running inside Claude Code, the agent already
-    has native browser tools (Playwright, WebFetch, Bash). We just describe the task
-    and let the agent execute it.
-
-    Returns a result dict {"success": bool, "method": "agent_browser", "error": str|None}
-    or None if claude CLI is not available.
-    """
-    import re
-
-    # Build a clean profile block (only non-empty fields)
-    profile_lines = []
-    field_labels = [
-        ("full_name",          "Full Name"),
-        ("email",              "Email"),
-        ("phone",              "Phone"),
-        ("linkedin_url",       "LinkedIn URL"),
-        ("github_url",         "GitHub URL"),
-        ("current_title",      "Current Title"),
-        ("location",           "Location"),
-        ("work_authorization", "Work Authorization"),
-        ("years_of_experience","Years of Experience"),
-    ]
-    for key, label in field_labels:
-        val = profile.get(key)
-        if val:
-            profile_lines.append(f"  {label}: {val}")
-    profile_block = "\n".join(profile_lines)
-
-    task = f"""You are acting as a job application agent. Your task is to fill and submit an online job application form using the playwright-cli skill.
-
-=== TASK ===
-Navigate to the URL below and complete the application form on behalf of the applicant.
-
-URL: {apply_url}
-
-=== APPLICANT PROFILE ===
-{profile_block}
-
-=== RESUME FILE ===
-Upload this file when a CV / resume file-upload field is present:
-  {resume_path}
-
-=== INSTRUCTIONS ===
-Use the playwright-cli skill to complete this task:
-
-1. Run: /playwright-cli
-2. Open the URL:          playwright-cli open {apply_url}
-3. Take a snapshot:       playwright-cli snapshot
-4. Accept any cookie banners (click Accept button if present)
-5. Click the Apply / Apply now button to open the application form
-6. Take a snapshot to see the form fields
-7. Fill each visible field using `playwright-cli fill <ref> "<value>"`
-   - First name / Given name → {profile.get("full_name", "").split()[0] if profile.get("full_name") else ""}
-   - Last name / Family name → {profile.get("full_name", "").split()[-1] if profile.get("full_name") else ""}
-   - Full name              → {profile.get("full_name", "")}
-   - Email                  → {profile.get("email", "")}
-   - Phone                  → {profile.get("phone", "")}
-   - City / Location        → {profile.get("location", "").split(",")[0].strip() if profile.get("location") else ""}
-   - Country                → {profile.get("location", "").split(",")[-1].strip() if profile.get("location") else ""}
-   - Address                → {profile.get("location", "")}
-8. If a file upload field exists: click it, then run:
-   playwright-cli upload "{resume_path}"
-9. Click the Submit / Apply / Send button
-10. Take a final snapshot to confirm submission
-11. Close browser: playwright-cli close
-
-=== OUTPUT ===
-After completing (or failing), return ONLY this JSON on the last line:
-{{"success": true, "method": "agent_browser", "error": null}}
-or if it failed:
-{{"success": false, "method": "agent_browser", "error": "brief reason"}}"""
-
-    cmd = _which("claude")
-    if not cmd:
-        return None
-
-    env = _clean_env()
-    try:
-        log.info("Handing external form to claude CLI agent browser")
-        result = subprocess.run(
-            [cmd, "-p", task],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=300,   # 5 min — agent needs time to browse + fill
-            env=env,
-        )
-        output = (result.stdout or "").strip()
-        log.debug(f"claude agent output:\n{output[-500:]}")
-
-        # Extract the last JSON object from the output
-        matches = re.findall(r'\{[^{}]*"success"[^{}]*\}', output)
-        if matches:
-            parsed = json.loads(matches[-1])
-            log.info(f"Agent browser result (claude): {parsed}")
-            return parsed
-
-        # No structured JSON — infer from text
-        last_lines = output.lower().split("\n")[-5:]
-        if any("success" in l and ("true" in l or ": true" in l) for l in last_lines):
-            return {"success": True, "method": "agent_browser", "error": None}
-        if result.returncode != 0:
-            log.warning(f"claude agent exited {result.returncode}: {result.stderr[:300]}")
-            return None
-
-        log.warning("claude completed (exit 0) but returned no structured result")
-        return None
-
-    except subprocess.TimeoutExpired:
-        log.warning("claude agent timed out (5 min)")
-        return None
-    except Exception as exc:
-        log.debug(f"claude agent error: {exc}")
-        return None
-
-
 def call_llm(
     prompt: str,
     system: str = "",
     model: str = DEFAULT_MODEL,
     image_b64: Optional[str] = None,
+    image_file: Optional[str] = None,
 ) -> str:
     """
     Call Claude CLI and return the response text.
 
-    Vision (image_b64) is not supported in CLI-only mode — raises RuntimeError
-    so callers can fall back to alternative strategies (e.g. blind form fill).
+    Note: image_file and image_b64 are NOT supported in CLI subprocess mode.
+    The --file flag requires session auth that isn't available in subprocess calls.
     """
-    if image_b64:
-        raise RuntimeError(
-            "Vision calls not supported in CLI-only mode. "
-            "External form fill will use blind fill instead."
-        )
+    if image_b64 or image_file:
+        log.debug("image_b64/image_file ignored — not supported in CLI subprocess mode")
 
     full_prompt = f"{system}\n\n{prompt}" if system else prompt
 

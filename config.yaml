@@ -1,17 +1,13 @@
 ﻿pipeline:
   target_role:                              # edit this: one or more job titles to search
     - "Site Reliability Engineer"
-    - "DevOps Engineer"
   target_location:                          # edit this: one or more locations
-    - "Dubai"
-    - "Abu Dhabi"
-    - "Sydney"
-    - "Melbourne"
+    - "Bangalore"
   target_platforms:                         # linkedin | glassdoor | naukri
     - "linkedin"
-  max_jobs_per_run: 3                       # max jobs to process per pipeline run
+  max_jobs_per_run: 5                       # max jobs to process per pipeline run
   days_back: 1                              # scrape jobs posted in last N days
-  min_match_score: 50                       # skip jobs below this ATS score (0-100)
+  min_match_score: 60                       # skip jobs below this ATS score (0-100)
   resume_template: "professional"           # professional | modern | classic
 
 paths:
@@ -23,7 +19,7 @@ paths:
   logs_dir: "logs"
 
 playwright:
-  headless: true                            # true = silent headless; false = visible browser
+  headless: false                           # true = silent headless; false = visible browser
   slow_mo: 50                               # ms between Playwright actions
   min_delay: 1.5                            # seconds between UI actions
   max_delay: 4.0
@@ -33,4 +29,22 @@ playwright:
     - "i'm not a robot"
     - "security check"
     - "prove you're human"
+
+# Pre-filled answers for common application questions that aren't in your resume.
+# The DOM agent uses these when a form asks something beyond profile fields.
+applicant:
+  notice_period: "30 days"
+  work_authorization: "Authorized to work in India"
+  visa_sponsorship_required: false
+  willing_to_relocate: true
+  willing_to_travel: true
+  salary_expectation: "Negotiable"
+  earliest_start_date: "Within 30 days"
+  languages:
+    - language: "English"
+      proficiency: "Professional"
+    - language: "Hindi"
+      proficiency: "Native"
+    - language: "Kannada"
+      proficiency: "Native"
 

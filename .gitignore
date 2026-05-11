@@ -20,6 +20,7 @@ data/~$*.xlsx
 data/profile_cache.json
 data/profile_cache.meta.json
 data/linkedin_session.json
+data/chrome_profile/
 
 # Excel tracker (personal data — generated per run)
 data/jobs_tracker.xlsx

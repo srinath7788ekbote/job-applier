@@ -16,21 +16,50 @@ import apply_jobs
 
 def test_detect_linkedin_auth_wall_true():
     page = MagicMock()
-    # Simulate a matching selector (login form present)
-    page.locator.return_value.count.return_value = 1
+    # Not logged in (no nav element), on login page
+    page.url = "https://www.linkedin.com/login"
+
+    def locator_side_effect(selector):
+        mock = MagicMock()
+        if "global-nav" in selector or "data-test-global-nav" in selector:
+            mock.count.return_value = 0  # not logged in
+        else:
+            mock.count.return_value = 1  # auth wall selector matches
+        return mock
+
+    page.locator.side_effect = locator_side_effect
     assert apply_jobs._detect_linkedin_auth_wall(page) is True
 
 
 def test_detect_linkedin_auth_wall_false():
     page = MagicMock()
-    page.locator.return_value.count.return_value = 0
+    page.url = "https://www.linkedin.com/jobs/view/123"
+
+    def locator_side_effect(selector):
+        mock = MagicMock()
+        if "global-nav" in selector or "data-test-global-nav" in selector:
+            mock.count.return_value = 1  # logged in
+        else:
+            mock.count.return_value = 0
+        return mock
+
+    page.locator.side_effect = locator_side_effect
     assert apply_jobs._detect_linkedin_auth_wall(page) is False
 
 
 def test_detect_linkedin_auth_wall_authwall_url():
     page = MagicMock()
-    # At least one selector matches
-    page.locator.return_value.count.return_value = 1
+    page.url = "https://www.linkedin.com/authwall"
+
+    def locator_side_effect(selector):
+        mock = MagicMock()
+        if "global-nav" in selector or "data-test-global-nav" in selector:
+            mock.count.return_value = 0  # not logged in
+        else:
+            mock.count.return_value = 0  # doesn't matter, URL check is enough
+        return mock
+
+    page.locator.side_effect = locator_side_effect
     assert apply_jobs._detect_linkedin_auth_wall(page) is True
 
 
@@ -48,13 +77,11 @@ def test_run_application_returns_agent_handoff_when_no_cli(monkeypatch, tmp_path
     # Patch the CLI calls to fail
     monkeypatch.setattr(apply_jobs, "_call_via_claude_cli", lambda *a, **kw: None, raising=False)
 
-    # Patch playwright to avoid real browser
-    mock_browser = MagicMock()
+    # Patch playwright to avoid real browser — mock the persistent context API
     mock_context = MagicMock()
     mock_page = MagicMock()
     mock_page.url = "https://www.linkedin.com/uas/login"
-    mock_context.new_page.return_value = mock_page
-    mock_browser.new_context.return_value = mock_context
+    mock_context.pages = [mock_page]
 
     fake_resume = tmp_path / "resume.pdf"
     fake_resume.write_bytes(b"%PDF fake")
@@ -62,7 +89,7 @@ def test_run_application_returns_agent_handoff_when_no_cli(monkeypatch, tmp_path
     profile = {"full_name": "Srinath Ekbote", "email": "test@example.com"}
 
     with patch("apply_jobs.sync_playwright") as mock_pw:
-        mock_pw.return_value.__enter__.return_value.chromium.launch.return_value = mock_browser
+        mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context.return_value = mock_context
         # Patch auth wall detection to return True immediately
         with patch.object(apply_jobs, "_detect_linkedin_auth_wall", return_value=True):
             with patch.object(apply_jobs, "_extract_external_apply_url", return_value=None):
